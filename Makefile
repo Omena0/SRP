@@ -3,7 +3,7 @@
 
 CC = gcc
 TARGET = srp
-CFLAGS = -Ofast -Wall -Wextra -march=native -flto
+CFLAGS = -O2 -Wall -Wextra
 LDFLAGS = -lws2_32
 
 # Windows-specific
@@ -11,7 +11,7 @@ ifeq ($(OS),Windows_NT)
 	TARGET := $(TARGET).exe
 	LDFLAGS = -lws2_32
 else
-	LDFLAGS = 
+	LDFLAGS = -lm
 	CFLAGS += -pthread
 endif
 
@@ -22,7 +22,7 @@ $(TARGET): main.c
 	chmod +x srp
 
 clean:
-	del /Q $(TARGET) 2>nul || rm -f $(TARGET)
+	rm $(TARGET)
 
 install: $(TARGET)
 	copy $(TARGET) C:\Windows\System32\ || cp $(TARGET) /usr/local/bin/

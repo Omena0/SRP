@@ -1,9 +1,6 @@
 # Build artifacts
 *.exe
-*.o
-*.obj
 srp
-*.out
 
 # IDE/Editor
 .vscode/
@@ -12,6 +9,4 @@ srp
 *.swo
 *~
 
-# OS
-.DS_Store
-Thumbs.db
+

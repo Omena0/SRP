@@ -9,6 +9,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <math.h>
+#include <ctype.h>
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -32,8 +34,8 @@ typedef int socklen_t;
 #endif
 
 #define BUFFER_SIZE 32767
-#define MAX_CONNECTIONS 256
-#define MAX_FORWARDED_PORTS 256
+#define MAX_CONNECTIONS 65536  // Now dynamically allocated, no memory waste
+#define MAX_FORWARDED_PORTS 65536  // Now dynamically allocated, no memory waste
 #define AUTH_TIMEOUT 5
 #define RATE_LIMIT_WINDOW 60
 #define MAX_AUTH_ATTEMPTS 3
@@ -82,6 +84,8 @@ typedef struct {
     socket_t listen_fd;
     socket_t tunnel_fd;
     char bind_addr[256];
+    char login_used[256];  // Track which login/password was used to forward this port
+    int is_claimed;  // Whether this port is claimed (permanent until unclaimed)
 } forwarded_port_t;
 
 typedef struct {
@@ -99,15 +103,26 @@ typedef struct {
 } packet_header_t;
 #pragma pack(pop)
 
-static connection_t connections[MAX_CONNECTIONS];
-static forwarded_port_t forwarded_ports[MAX_FORWARDED_PORTS];
+static connection_t *connections = NULL;
+static forwarded_port_t *forwarded_ports = NULL;
 static int forwarded_port_count = 0;
-static forward_config_t forward_configs[MAX_FORWARDED_PORTS];
+static forward_config_t *forward_configs = NULL;
 static int forward_config_count = 0;
-static rate_limit_entry_t rate_limits[256];
+static rate_limit_entry_t *rate_limits = NULL;  // Dynamically allocated for 64K entries
 static int rate_limit_count = 0;
 static volatile int running = 1;
 static char password[256];
+static char logins_file[64] = "logins.conf";  // Path to dynamic logins file
+
+// Server configuration limits
+static int min_port = 1024;  // Minimum allowed port to forward
+static int max_port = 65535;  // Maximum allowed port to forward
+static int ports_per_login = 10;  // Maximum claimed ports per login
+static int logins_per_ip = 5;  // Maximum logins per IP address
+static int *restricted_ports = NULL;  // Dynamically allocated restricted ports list
+static int restricted_port_count = 0;
+static int max_restricted_ports = 1024;  // Initial capacity
+
 static volatile unsigned long long total_connections = 0;
 static volatile int active_clients = 0;
 static volatile int tunnel_connected = 0;  // Track tunnel connection status
@@ -157,11 +172,25 @@ static connection_t* get_connection(socket_t fd);
 static connection_t* alloc_connection(socket_t fd);
 static void cleanup_connection(connection_t *conn);
 static forwarded_port_t* get_forwarded_port(int port);
-static int add_forwarded_port(int port, socket_t listen_fd, socket_t tunnel_fd, const char *bind_addr);
+static int add_forwarded_port(int port, socket_t listen_fd, socket_t tunnel_fd, const char *bind_addr, const char *login);
 static void remove_forwarded_port(int port);
+static int count_ports_for_login(const char *login);
 static void remove_forwarded_ports_for_tunnel(socket_t tunnel_fd);
 static int check_rate_limit(const char *ip);
 static void update_rate_limit(const char *ip, int success);
+static int check_password(const char *pass);
+static unsigned int simple_hash(const char *str);
+static double calculate_entropy(const char *password);
+static int validate_password(const char *password, char *error_msg, size_t error_size);
+static int count_logins_for_ip(const char *ip);
+static int is_port_restricted(int port);
+static int get_claimed_ports_for_login(const char *login, int *ports, int max_ports);
+static int is_port_claimed_by_anyone(int port);
+static int save_claimed_port(const char *login, int port);
+static int remove_claimed_port(const char *login, int port);
+static int register_user(const char *username, const char *password);
+static int delete_user(const char *username, const char *password);
+static int load_client_config(char *server_addr, int *server_port, char *username, char *password);
 static int send_packet(socket_t fd, unsigned short session_id, const char *data, unsigned short length);
 static int forward_mode(int local_port, int server_port, const char *tunnel_addr, int tunnel_port);
 static int serve_mode(const char *bind_addr, int tunnel_port);
@@ -247,16 +276,24 @@ static forwarded_port_t* get_forwarded_port(int port) {
     return NULL;
 }
 
-static int add_forwarded_port(int port, socket_t listen_fd, socket_t tunnel_fd, const char *bind_addr) {
+static int add_forwarded_port(int port, socket_t listen_fd, socket_t tunnel_fd, const char *bind_addr, const char *login) {
     if (forwarded_port_count >= MAX_FORWARDED_PORTS) {
         return -1;
     }
     forwarded_ports[forwarded_port_count].port = port;
     forwarded_ports[forwarded_port_count].listen_fd = listen_fd;
     forwarded_ports[forwarded_port_count].tunnel_fd = tunnel_fd;
+    forwarded_ports[forwarded_port_count].is_claimed = 0;
     strncpy(forwarded_ports[forwarded_port_count].bind_addr, bind_addr, sizeof(forwarded_ports[forwarded_port_count].bind_addr) - 1);
+    strncpy(forwarded_ports[forwarded_port_count].login_used, login, sizeof(forwarded_ports[forwarded_port_count].login_used) - 1);
     forwarded_port_count++;
     return 0;
+}
+
+static int count_ports_for_login(const char *login) {
+    // Count only claimed ports
+    int claimed_ports[MAX_FORWARDED_PORTS];
+    return get_claimed_ports_for_login(login, claimed_ports, MAX_FORWARDED_PORTS);
 }
 
 static void remove_forwarded_port(int port) {
@@ -319,13 +356,535 @@ static void update_rate_limit(const char *ip, int success) {
             return;
         }
     }
-    if (rate_limit_count < 256 && !success) {
+    if (rate_limit_count < 65536 && !success) {
         strncpy(rate_limits[rate_limit_count].ip, ip, INET_ADDRSTRLEN - 1);
         rate_limits[rate_limit_count].attempts = 1;
         rate_limits[rate_limit_count].first_attempt = now;
         rate_limits[rate_limit_count].last_attempt = now;
         rate_limit_count++;
     }
+}
+
+// Simple hash function for passwords (using djb2 algorithm)
+static unsigned int simple_hash(const char *str) {
+    unsigned int hash = 5381;
+    int c;
+    while ((c = *str++)) {
+        hash = ((hash << 5) + hash) + c; /* hash * 33 + c */
+    }
+    return hash;
+}
+
+// Calculate Shannon entropy in bits
+static double calculate_entropy(const char *password) {
+    int freq[256] = {0};
+    int len = strlen(password);
+    if (len == 0) return 0.0;
+
+    for (int i = 0; i < len; i++) {
+        freq[(unsigned char)password[i]]++;
+    }
+
+    double entropy = 0.0;
+    for (int i = 0; i < 256; i++) {
+        if (freq[i] > 0) {
+            double p = (double)freq[i] / len;
+            entropy -= p * (log(p) / log(2));
+        }
+    }
+
+    return entropy * len;  // Total entropy in bits
+}
+
+// Validate password meets requirements
+static int validate_password(const char *password, char *error_msg, size_t error_size) {
+    int len = strlen(password);
+
+    // Check minimum length
+    if (len < 6) {
+        snprintf(error_msg, error_size, "Password must be at least 6 characters");
+        return 0;
+    }
+
+    // Check for invalid characters (no | allowed)
+    for (int i = 0; i < len; i++) {
+        if (password[i] == '|') {
+            snprintf(error_msg, error_size, "Password cannot contain '|' character");
+            return 0;
+        }
+        if (!isprint((unsigned char)password[i])) {
+            snprintf(error_msg, error_size, "Password must contain only printable characters");
+            return 0;
+        }
+    }
+
+    // Check entropy
+    double entropy = calculate_entropy(password);
+    if (entropy < 32.0) {
+        snprintf(error_msg, error_size, "Password entropy too low (%.1f bits, need 32+)", entropy);
+        return 0;
+    }
+
+    return 1;
+}
+
+// Count active logins from a specific IP
+static int count_logins_for_ip(const char *ip) {
+    int count = 0;
+    for (int i = 0; i < MAX_CONNECTIONS; i++) {
+        if (connections[i].fd != INVALID_SOCK && connections[i].is_tunnel) {
+            struct sockaddr_in peer_addr;
+            socklen_t peer_len = sizeof(peer_addr);
+            if (getpeername(connections[i].fd, (struct sockaddr*)&peer_addr, &peer_len) == 0) {
+                char conn_ip[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &peer_addr.sin_addr, conn_ip, sizeof(conn_ip));
+                if (strcmp(conn_ip, ip) == 0) {
+                    count++;
+                }
+            }
+        }
+    }
+    return count;
+}
+
+// Check if port is in restricted list
+static int is_port_restricted(int port) {
+    for (int i = 0; i < restricted_port_count; i++) {
+        if (restricted_ports[i] == port) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Get claimed ports for a login from logins.conf
+static int get_claimed_ports_for_login(const char *login, int *ports, int max_ports) {
+    FILE *f = fopen(logins_file, "r");
+    if (!f) return 0;
+
+    char line[512];
+    int count = 0;
+
+    while (fgets(line, sizeof(line), f)) {
+        line[strcspn(line, "\r\n")] = 0;
+        if (line[0] == '#' || line[0] == '/' || line[0] == '\0') continue;
+
+        // Extract username from line (format: username:hash|port1,port2 or username:hash)
+        char temp[512];
+        strncpy(temp, line, sizeof(temp) - 1);
+        temp[sizeof(temp) - 1] = '\0';
+        
+        char *pipe = strchr(temp, '|');
+        char *ports_str = NULL;
+        
+        if (pipe) {
+            *pipe = '\0';
+            ports_str = pipe + 1;
+        }
+        
+        char *colon = strchr(temp, ':');
+        if (colon) *colon = '\0';
+        
+        // temp now contains just the username
+        if (strcmp(temp, login) == 0) {
+            // Parse ports if they exist
+            if (ports_str) {
+                char ports_copy[256];
+                strncpy(ports_copy, ports_str, sizeof(ports_copy) - 1);
+                ports_copy[sizeof(ports_copy) - 1] = '\0';
+                
+                char *token = strtok(ports_copy, ",");
+                while (token && count < max_ports) {
+                    ports[count++] = atoi(token);
+                    token = strtok(NULL, ",");
+                }
+            }
+            break;
+        }
+    }
+
+    fclose(f);
+    return count;
+}
+
+// Check if a port is claimed by any user
+static int is_port_claimed_by_anyone(int port) {
+    FILE *f = fopen(logins_file, "r");
+    if (!f) return 0;
+
+    char line[512];
+
+    while (fgets(line, sizeof(line), f)) {
+        line[strcspn(line, "\r\n")] = 0;
+        if (line[0] == '#' || line[0] == '/' || line[0] == '\0') continue;
+
+        // Check if this line has claimed ports
+        char *pipe = strchr(line, '|');
+        if (pipe) {
+            char ports_str[256];
+            strncpy(ports_str, pipe + 1, sizeof(ports_str) - 1);
+            ports_str[sizeof(ports_str) - 1] = '\0';
+            
+            // Parse ports
+            char *token = strtok(ports_str, ",");
+            while (token) {
+                if (atoi(token) == port) {
+                    fclose(f);
+                    return 1;  // Port is claimed
+                }
+                token = strtok(NULL, ",");
+            }
+        }
+    }
+
+    fclose(f);
+    return 0;  // Port is not claimed
+}
+
+// Save a claimed port for a login
+static int save_claimed_port(const char *login, int port) {
+    FILE *f = fopen(logins_file, "r");
+    if (!f) return 0;
+
+    char lines[1024][512];
+    int line_count = 0;
+    int found_index = -1;
+
+    // Read ALL lines first
+    while (fgets(lines[line_count], sizeof(lines[line_count]), f) && line_count < 1024) {
+        lines[line_count][strcspn(lines[line_count], "\r\n")] = 0;
+        line_count++;
+    }
+    fclose(f);
+
+    // Now find and modify the target line
+    for (int i = 0; i < line_count; i++) {
+        if (lines[i][0] == '#' || lines[i][0] == '/' || lines[i][0] == '\0') continue;
+
+        // Extract username from line
+        char temp[512];
+        strncpy(temp, lines[i], sizeof(temp) - 1);
+        temp[sizeof(temp) - 1] = '\0';
+        
+        char *pipe = strchr(temp, '|');
+        if (pipe) *pipe = '\0';
+        
+        char *colon = strchr(temp, ':');
+        if (colon) *colon = '\0';
+        
+        // temp now contains just the username
+        if (strcmp(temp, login) == 0) {
+            // Found the login, now modify the line
+            char *orig_pipe = strchr(lines[i], '|');
+            char new_line[512];
+            
+            if (orig_pipe) {
+                // Already has claimed ports, append new one
+                int prefix_len = orig_pipe - lines[i];
+                char prefix[512];
+                strncpy(prefix, lines[i], prefix_len);
+                prefix[prefix_len] = '\0';
+                
+                snprintf(new_line, sizeof(new_line), "%s|%s,%d", prefix, orig_pipe + 1, port);
+            } else {
+                // No ports yet, add the pipe and port
+                snprintf(new_line, sizeof(new_line), "%s|%d", lines[i], port);
+            }
+            
+            strncpy(lines[i], new_line, sizeof(lines[i]) - 1);
+            lines[i][sizeof(lines[i]) - 1] = '\0';
+            
+            found_index = i;
+            break;
+        }
+    }
+
+    if (found_index == -1) return 0;
+
+    // Write back all lines
+    f = fopen(logins_file, "w");
+    if (!f) return 0;
+
+    for (int i = 0; i < line_count; i++) {
+        fprintf(f, "%s\n", lines[i]);
+    }
+    fclose(f);
+    return 1;
+}
+
+// Remove a claimed port from a login
+static int remove_claimed_port(const char *login, int port) {
+    FILE *f = fopen(logins_file, "r");
+    if (!f) return 0;
+
+    char lines[1024][512];
+    int line_count = 0;
+    int found = 0;
+
+    while (fgets(lines[line_count], sizeof(lines[line_count]), f) && line_count < 1024) {
+        lines[line_count][strcspn(lines[line_count], "\r\n")] = 0;
+
+        if (lines[line_count][0] != '#' && lines[line_count][0] != '/' && lines[line_count][0] != '\0') {
+            // Extract username from line (username:hash|ports or username:hash)
+            char temp[512];
+            strncpy(temp, lines[line_count], sizeof(temp) - 1);
+            temp[sizeof(temp) - 1] = '\0';
+            
+            char *pipe_pos = strchr(temp, '|');
+            if (pipe_pos) *pipe_pos = '\0';
+            
+            char *colon = strchr(temp, ':');
+            if (colon) *colon = '\0';
+            
+            // temp now contains just the username
+            if (strcmp(temp, login) == 0) {
+                // Found the login, now modify the original line
+                char *orig_pipe = strchr(lines[line_count], '|');
+                
+                if (orig_pipe) {
+                    // Has claimed ports, remove the specified one
+                    char username_hash[512];
+                    strncpy(username_hash, lines[line_count], orig_pipe - lines[line_count]);
+                    username_hash[orig_pipe - lines[line_count]] = '\0';
+                    
+                    char *ports_str = orig_pipe + 1;
+                    char ports_copy[256];
+                    strncpy(ports_copy, ports_str, sizeof(ports_copy) - 1);
+                    ports_copy[sizeof(ports_copy) - 1] = '\0';
+                    
+                    char new_ports[256] = "";
+                    char *token = strtok(ports_copy, ",");
+                    int first = 1;
+
+                    while (token) {
+                        int p = atoi(token);
+                        if (p != port) {
+                            if (!first) strcat(new_ports, ",");
+                            char port_str[16];
+                            snprintf(port_str, sizeof(port_str), "%d", p);
+                            strcat(new_ports, port_str);
+                            first = 0;
+                        }
+                        token = strtok(NULL, ",");
+                    }
+
+                    if (strlen(new_ports) > 0) {
+                        snprintf(lines[line_count], sizeof(lines[line_count]), "%s|%s", username_hash, new_ports);
+                    } else {
+                        snprintf(lines[line_count], sizeof(lines[line_count]), "%s", username_hash);
+                    }
+                    found = 1;
+                }
+                break;
+            }
+        }
+        line_count++;
+    }
+    fclose(f);
+
+    if (!found) return 0;
+
+    // Write back
+    f = fopen(logins_file, "w");
+    if (!f) return 0;
+
+    for (int i = 0; i < line_count; i++) {
+        fprintf(f, "%s\n", lines[i]);
+    }
+    fclose(f);
+    return 1;
+}
+
+// Register a new user
+static int register_user(const char *username, const char *password) {
+    char error_msg[256];
+
+    // Validate username (no colons or pipes)
+    if (strchr(username, ':') || strchr(username, '|')) {
+        fprintf(stderr, "Username cannot contain ':' or '|'\n");
+        return 0;
+    }
+
+    // Validate password
+    if (!validate_password(password, error_msg, sizeof(error_msg))) {
+        fprintf(stderr, "Password validation failed: %s\n", error_msg);
+        return 0;
+    }
+
+    // Hash password
+    unsigned int hash = simple_hash(password);
+
+    // Check if user already exists
+    FILE *f = fopen(logins_file, "r");
+    if (f) {
+        char line[512];
+        while (fgets(line, sizeof(line), f)) {
+            line[strcspn(line, "\r\n")] = 0;
+            if (line[0] == '#' || line[0] == '/' || line[0] == '\0') continue;
+
+            char *colon = strchr(line, ':');
+            char *pipe = strchr(line, '|');
+            if (pipe && (!colon || pipe < colon)) {
+                // Handle case where there's a pipe before colon
+                continue;
+            }
+            if (colon) {
+                *colon = '\0';
+                if (strcmp(line, username) == 0) {
+                    fclose(f);
+                    fprintf(stderr, "User already exists\n");
+                    return 0;
+                }
+            }
+        }
+        fclose(f);
+    }
+
+    // Append new user
+    f = fopen(logins_file, "a");
+    if (!f) {
+        perror("Failed to open logins.conf");
+        return 0;
+    }
+
+    fprintf(f, "%s:%u\n", username, hash);
+    fclose(f);
+
+    printf("User '%s' registered successfully\n", username);
+    return 1;
+}
+
+// Delete a user account
+static int delete_user(const char *username, const char *password) {
+    unsigned int hash = simple_hash(password);
+
+    FILE *f = fopen(logins_file, "r");
+    if (!f) return 0;
+
+    char lines[1024][512];
+    int line_count = 0;
+    int found = 0;
+    int deleted_index = -1;
+
+    while (fgets(lines[line_count], sizeof(lines[line_count]), f) && line_count < 1024) {
+        lines[line_count][strcspn(lines[line_count], "\r\n")] = 0;
+
+        if (lines[line_count][0] != '#' && lines[line_count][0] != '/' && lines[line_count][0] != '\0') {
+            char temp[512];
+            strncpy(temp, lines[line_count], sizeof(temp) - 1);
+
+            char *colon = strchr(temp, ':');
+            char *pipe = strchr(temp, '|');
+
+            if (pipe && (!colon || pipe < colon)) {
+                // Skip malformed lines
+                line_count++;
+                continue;
+            }
+
+            if (colon) {
+                *colon = '\0';
+                unsigned int stored_hash = (unsigned int)strtoul(colon + 1, NULL, 10);
+
+                if (strcmp(temp, username) == 0 && stored_hash == hash) {
+                    found = 1;
+                    deleted_index = line_count;
+                }
+            }
+        }
+        line_count++;
+    }
+    fclose(f);
+
+    if (!found) {
+        fprintf(stderr, "User not found or password incorrect\n");
+        return 0;
+    }
+
+    // Write back without deleted user
+    f = fopen(logins_file, "w");
+    if (!f) return 0;
+
+    for (int i = 0; i < line_count; i++) {
+        if (i != deleted_index) {
+            fprintf(f, "%s\n", lines[i]);
+        }
+    }
+    fclose(f);
+
+    printf("User '%s' deleted successfully\n", username);
+    return 1;
+}
+
+static int check_password(const char *pass) {
+    // First check the main password
+    if (strcmp(pass, password) == 0) {
+        return 1;
+    }
+
+    // Try to load passwords from logins.conf
+    // Format: username:hashed_password or username:hashed_password|port1,port2
+    FILE *f = fopen(logins_file, "r");
+    if (!f) {
+        return 0;  // File doesn't exist, password not found
+    }
+
+    char line[512];
+    int found = 0;
+    while (fgets(line, sizeof(line), f)) {
+        // Remove trailing newline/whitespace
+        line[strcspn(line, "\r\n")] = 0;
+
+        // Skip comments and empty lines
+        if (line[0] == '#' || line[0] == '/' || line[0] == '\0') continue;
+
+        // Trim leading whitespace
+        char *trimmed = line;
+        while (*trimmed == ' ' || *trimmed == '\t') trimmed++;
+
+        // Split by pipe first to remove port data
+        char *pipe = strchr(trimmed, '|');
+        if (pipe) *pipe = '\0';
+
+        // Now check username:hash format
+        char *colon = strchr(trimmed, ':');
+        if (colon) {
+            // Split into username and hash
+            *colon = '\0';
+            char *username = trimmed;
+            char *hash_str = colon + 1;
+            unsigned int stored_hash = (unsigned int)strtoul(hash_str, NULL, 10);
+
+            // Pass format is username:password, we need to split and verify
+            char pass_copy[256];
+            strncpy(pass_copy, pass, sizeof(pass_copy) - 1);
+            pass_copy[sizeof(pass_copy) - 1] = '\0';
+
+            char *pass_colon = strchr(pass_copy, ':');
+            if (pass_colon) {
+                *pass_colon = '\0';
+                char *pass_username = pass_copy;
+                char *pass_password = pass_colon + 1;
+
+                if (strcmp(username, pass_username) == 0) {
+                    unsigned int pass_hash = simple_hash(pass_password);
+                    if (pass_hash == stored_hash) {
+                        found = 1;
+                        break;
+                    }
+                }
+            }
+        } else {
+            // Old format compatibility - direct password match
+            if (strcmp(trimmed, pass) == 0) {
+                found = 1;
+                break;
+            }
+        }
+    }
+
+    fclose(f);
+    return found;
 }
 
 static int send_packet(socket_t fd, unsigned short session_id, const char *data, unsigned short length) {
@@ -489,7 +1048,7 @@ static void print_status(const char *mode, int tunnel_active, int clients) {
         term_height = w.ws_row;
     }
 #endif
-    if (term_width < 50) term_width = 50;  // Minimum width
+    if (term_width < 40) term_width = 40;  // Minimum width
 
     int box_width = term_width - 2;  // Account for borders
 
@@ -562,7 +1121,7 @@ static void print_status(const char *mode, int tunnel_active, int clients) {
         int right_text_len = 11; // "Statistics" length
         int left_equals = (left_width - left_text_len - 2) / 2;
         int right_equals = (right_width - right_text_len - 2) / 2;
-        
+
         printf("|");
         for (int i = 0; i < left_equals+1; i++) printf("=");
         printf(" Forwards ");
@@ -1128,6 +1687,326 @@ static int serve_mode(const char *bind_addr, int tunnel_port) {
 
                 buf[n] = '\0';
 
+                // Handle CLAIM command: CLAIM:username:hashed_password:port
+                if (strncmp(buf, "CLAIM:", 6) == 0) {
+                    char *username_start = buf + 6;
+                    char *hash_str = strchr(username_start, ':');
+                    if (!hash_str) {
+                        send(conn->fd, "ERROR:Invalid claim format", 27, SEND_FLAGS);
+                        cleanup_connection(conn);
+                        continue;
+                    }
+                    *hash_str = '\0';
+                    hash_str++;
+
+                    char *port_str = strchr(hash_str, ':');
+                    if (!port_str) {
+                        send(conn->fd, "ERROR:Invalid claim format", 27, SEND_FLAGS);
+                        cleanup_connection(conn);
+                        continue;
+                    }
+                    *port_str = '\0';
+                    port_str++;
+
+                    int claim_port = atoi(port_str);
+                    unsigned int hash = (unsigned int)strtoul(hash_str, NULL, 10);
+
+                    // Verify credentials
+                    char login[512];
+                    snprintf(login, sizeof(login), "%s:%u", username_start, hash);
+
+                    // For claim, we need to manually verify the hash
+                    FILE *f = fopen(logins_file, "r");
+                    int valid = 0;
+                    if (f) {
+                        char line[512];
+                        while (fgets(line, sizeof(line), f)) {
+                            line[strcspn(line, "\r\n")] = 0;
+                            if (line[0] == '#' || line[0] == '/' || line[0] == '\0') continue;
+
+                            char *pipe = strchr(line, '|');
+                            if (pipe) *pipe = '\0';
+
+                            char *colon = strchr(line, ':');
+                            if (colon) {
+                                *colon = '\0';
+                                unsigned int stored_hash = (unsigned int)strtoul(colon + 1, NULL, 10);
+                                if (strcmp(line, username_start) == 0 && stored_hash == hash) {
+                                    valid = 1;
+                                    break;
+                                }
+                            }
+                        }
+                        fclose(f);
+                    }
+
+                    if (!valid) {
+                        send(conn->fd, "ERROR:Invalid credentials", 25, SEND_FLAGS);
+                        cleanup_connection(conn);
+                        continue;
+                    }
+
+                    // Check port restrictions
+                    if (is_port_restricted(claim_port)) {
+                        send(conn->fd, "ERROR:Port is restricted", 24, SEND_FLAGS);
+                        cleanup_connection(conn);
+                        continue;
+                    }
+
+                    // Check if port is claimed by anyone
+                    if (is_port_claimed_by_anyone(claim_port)) {
+                        send(conn->fd, "ERROR:Port already claimed", 26, SEND_FLAGS);
+                        cleanup_connection(conn);
+                        continue;
+                    }
+
+                    // Check if already claimed
+                    int claimed_ports[MAX_FORWARDED_PORTS];
+                    int num_claimed = get_claimed_ports_for_login(username_start, claimed_ports, MAX_FORWARDED_PORTS);
+                    int already_claimed = 0;
+                    for (int i = 0; i < num_claimed; i++) {
+                        if (claimed_ports[i] == claim_port) {
+                            already_claimed = 1;
+                            break;
+                        }
+                    }
+
+                    if (already_claimed) {
+                        send(conn->fd, "ERROR:Port already claimed by you", 33, SEND_FLAGS);
+                        cleanup_connection(conn);
+                        continue;
+                    }
+
+                    // Check port limit
+                    if (num_claimed >= ports_per_login) {
+                        char error_msg[128];
+                        snprintf(error_msg, sizeof(error_msg), "ERROR:Maximum claimed ports reached (%d/%d)",
+                                num_claimed, ports_per_login);
+                        send(conn->fd, error_msg, (int)strlen(error_msg), SEND_FLAGS);
+                        cleanup_connection(conn);
+                        continue;
+                    }
+
+                    // Save claim
+                    if (save_claimed_port(username_start, claim_port)) {
+                        send(conn->fd, "OK:Port claimed successfully", 28, SEND_FLAGS);
+                    } else {
+                        send(conn->fd, "ERROR:Failed to save claim", 26, SEND_FLAGS);
+                    }
+                    cleanup_connection(conn);
+                    continue;
+                }
+
+                // Handle UNCLAIM command: UNCLAIM:username:hashed_password:port
+                if (strncmp(buf, "UNCLAIM:", 8) == 0) {
+                    char *username_start = buf + 8;
+                    char *hash_str = strchr(username_start, ':');
+                    if (!hash_str) {
+                        send(conn->fd, "ERROR:Invalid unclaim format", 28, SEND_FLAGS);
+                        cleanup_connection(conn);
+                        continue;
+                    }
+                    *hash_str = '\0';
+                    hash_str++;
+
+                    char *port_str = strchr(hash_str, ':');
+                    if (!port_str) {
+                        send(conn->fd, "ERROR:Invalid unclaim format", 28, SEND_FLAGS);
+                        cleanup_connection(conn);
+                        continue;
+                    }
+                    *port_str = '\0';
+                    port_str++;
+
+                    int unclaim_port = atoi(port_str);
+                    unsigned int hash = (unsigned int)strtoul(hash_str, NULL, 10);
+
+                    // Verify credentials
+                    FILE *f = fopen(logins_file, "r");
+                    int valid = 0;
+                    if (f) {
+                        char line[512];
+                        while (fgets(line, sizeof(line), f)) {
+                            line[strcspn(line, "\r\n")] = 0;
+                            if (line[0] == '#' || line[0] == '/' || line[0] == '\0') continue;
+
+                            char *pipe = strchr(line, '|');
+                            if (pipe) *pipe = '\0';
+
+                            char *colon = strchr(line, ':');
+                            if (colon) {
+                                *colon = '\0';
+                                unsigned int stored_hash = (unsigned int)strtoul(colon + 1, NULL, 10);
+                                if (strcmp(line, username_start) == 0 && stored_hash == hash) {
+                                    valid = 1;
+                                    break;
+                                }
+                            }
+                        }
+                        fclose(f);
+                    }
+
+                    if (!valid) {
+                        send(conn->fd, "ERROR:Invalid credentials", 25, SEND_FLAGS);
+                        cleanup_connection(conn);
+                        continue;
+                    }
+
+                    // Remove claim
+                    if (remove_claimed_port(username_start, unclaim_port)) {
+                        send(conn->fd, "OK:Port unclaimed successfully", 30, SEND_FLAGS);
+                    } else {
+                        send(conn->fd, "ERROR:Port not claimed by you", 29, SEND_FLAGS);
+                    }
+                    cleanup_connection(conn);
+                    continue;
+                }
+
+                // Handle REGISTER command: REGISTER:username:hashed_password
+                if (strncmp(buf, "REGISTER:", 9) == 0) {
+                    char *username_start = buf + 9;
+                    char *hash_str = strchr(username_start, ':');
+                    if (!hash_str) {
+                        send(conn->fd, "ERROR:Invalid register format", 29, SEND_FLAGS);
+                        cleanup_connection(conn);
+                        continue;
+                    }
+                    *hash_str = '\0';
+                    hash_str++;
+                    
+                    unsigned int hash = (unsigned int)strtoul(hash_str, NULL, 10);
+                    
+                    // Validate username (no colons or pipes)
+                    if (strchr(username_start, ':') || strchr(username_start, '|')) {
+                        send(conn->fd, "ERROR:Username cannot contain ':' or '|'", 40, SEND_FLAGS);
+                        cleanup_connection(conn);
+                        continue;
+                    }
+                    
+                    // Check if user already exists
+                    FILE *f = fopen(logins_file, "r");
+                    int exists = 0;
+                    if (f) {
+                        char line[512];
+                        while (fgets(line, sizeof(line), f)) {
+                            line[strcspn(line, "\r\n")] = 0;
+                            if (line[0] == '#' || line[0] == '/' || line[0] == '\0') continue;
+                            
+                            char *pipe = strchr(line, '|');
+                            if (pipe) *pipe = '\0';
+                            
+                            char *colon = strchr(line, ':');
+                            if (colon) {
+                                *colon = '\0';
+                                if (strcmp(line, username_start) == 0) {
+                                    exists = 1;
+                                    break;
+                                }
+                            }
+                        }
+                        fclose(f);
+                    }
+                    
+                    if (exists) {
+                        send(conn->fd, "ERROR:User already exists", 25, SEND_FLAGS);
+                        cleanup_connection(conn);
+                        continue;
+                    }
+                    
+                    // Append new user
+                    f = fopen(logins_file, "a");
+                    if (!f) {
+                        send(conn->fd, "ERROR:Failed to create user", 27, SEND_FLAGS);
+                        cleanup_connection(conn);
+                        continue;
+                    }
+                    
+                    fprintf(f, "%s:%u\n", username_start, hash);
+                    fclose(f);
+                    
+                    send(conn->fd, "OK:User registered successfully", 31, SEND_FLAGS);
+                    cleanup_connection(conn);
+                    continue;
+                }
+                
+                // Handle DELETEACC command: DELETEACC:username:hashed_password
+                if (strncmp(buf, "DELETEACC:", 10) == 0) {
+                    char *username_start = buf + 10;
+                    char *hash_str = strchr(username_start, ':');
+                    if (!hash_str) {
+                        send(conn->fd, "ERROR:Invalid deleteacc format", 30, SEND_FLAGS);
+                        cleanup_connection(conn);
+                        continue;
+                    }
+                    *hash_str = '\0';
+                    hash_str++;
+                    
+                    unsigned int hash = (unsigned int)strtoul(hash_str, NULL, 10);
+                    
+                    // Verify credentials and delete
+                    FILE *f = fopen(logins_file, "r");
+                    if (!f) {
+                        send(conn->fd, "ERROR:Failed to access users", 28, SEND_FLAGS);
+                        cleanup_connection(conn);
+                        continue;
+                    }
+                    
+                    char lines[1024][512];
+                    int line_count = 0;
+                    int found = 0;
+                    int deleted_index = -1;
+                    
+                    while (fgets(lines[line_count], sizeof(lines[line_count]), f) && line_count < 1024) {
+                        lines[line_count][strcspn(lines[line_count], "\r\n")] = 0;
+                        
+                        if (lines[line_count][0] != '#' && lines[line_count][0] != '/' && lines[line_count][0] != '\0') {
+                            char temp[512];
+                            strncpy(temp, lines[line_count], sizeof(temp) - 1);
+                            
+                            char *pipe = strchr(temp, '|');
+                            if (pipe) *pipe = '\0';
+                            
+                            char *colon = strchr(temp, ':');
+                            if (colon) {
+                                *colon = '\0';
+                                unsigned int stored_hash = (unsigned int)strtoul(colon + 1, NULL, 10);
+                                
+                                if (strcmp(temp, username_start) == 0 && stored_hash == hash) {
+                                    found = 1;
+                                    deleted_index = line_count;
+                                }
+                            }
+                        }
+                        line_count++;
+                    }
+                    fclose(f);
+                    
+                    if (!found) {
+                        send(conn->fd, "ERROR:User not found or password incorrect", 42, SEND_FLAGS);
+                        cleanup_connection(conn);
+                        continue;
+                    }
+                    
+                    // Write back without deleted user
+                    f = fopen(logins_file, "w");
+                    if (!f) {
+                        send(conn->fd, "ERROR:Failed to delete user", 27, SEND_FLAGS);
+                        cleanup_connection(conn);
+                        continue;
+                    }
+                    
+                    for (int i = 0; i < line_count; i++) {
+                        if (i != deleted_index) {
+                            fprintf(f, "%s\n", lines[i]);
+                        }
+                    }
+                    fclose(f);
+                    
+                    send(conn->fd, "OK:User deleted successfully", 28, SEND_FLAGS);
+                    cleanup_connection(conn);
+                    continue;
+                }
+
                 if (strncmp(buf, "AUTH:", 5) == 0) {
                     char *pass_start = buf + 5;
                     char *port_str = strchr(pass_start, ':');
@@ -1137,12 +2016,94 @@ static int serve_mode(const char *bind_addr, int tunnel_port) {
                         port_str++;
                         int requested_port = atoi(port_str);
 
-                        if (strcmp(pass_start, password) == 0 && requested_port > 0) {
+                        if (check_password(pass_start) && requested_port > 0) {
                             struct sockaddr_in peer_addr;
                             socklen_t peer_len = sizeof(peer_addr);
                             getpeername(conn->fd, (struct sockaddr*)&peer_addr, &peer_len);
                             char ip[INET_ADDRSTRLEN];
                             inet_ntop(AF_INET, &peer_addr.sin_addr, ip, sizeof(ip));
+
+                            // Check logins per IP limit
+                            int ip_logins = count_logins_for_ip(ip);
+                            if (ip_logins >= logins_per_ip) {
+                                char error_msg[128];
+                                snprintf(error_msg, sizeof(error_msg), "ERROR:Too many logins from this IP (%d/%d)",
+                                        ip_logins, logins_per_ip);
+                                send(conn->fd, error_msg, (int)strlen(error_msg), SEND_FLAGS);
+                                update_rate_limit(ip, 0);
+#ifdef _WIN32
+                                Sleep(1000);
+#else
+                                sleep(1);
+#endif
+                                cleanup_connection(conn);
+                                continue;
+                            }
+
+                            // Check if port is restricted
+                            if (is_port_restricted(requested_port)) {
+                                char error_msg[128];
+                                snprintf(error_msg, sizeof(error_msg), "ERROR:Port %d is restricted", requested_port);
+                                send(conn->fd, error_msg, (int)strlen(error_msg), SEND_FLAGS);
+                                update_rate_limit(ip, 0);
+#ifdef _WIN32
+                                Sleep(1000);
+#else
+                                sleep(1);
+#endif
+                                cleanup_connection(conn);
+                                continue;
+                            }
+
+                            // Check port range
+                            if (requested_port < min_port || requested_port > max_port) {
+                                char error_msg[128];
+                                snprintf(error_msg, sizeof(error_msg), "ERROR:Port %d outside allowed range (%d-%d)",
+                                        requested_port, min_port, max_port);
+                                send(conn->fd, error_msg, (int)strlen(error_msg), SEND_FLAGS);
+                                update_rate_limit(ip, 0);
+#ifdef _WIN32
+                                Sleep(1000);
+#else
+                                sleep(1);
+#endif
+                                cleanup_connection(conn);
+                                continue;
+                            }
+
+                            // Check if port is already forwarded
+                            forwarded_port_t *existing = get_forwarded_port(requested_port);
+                            if (existing) {
+                                char error_msg[128];
+                                snprintf(error_msg, sizeof(error_msg), "ERROR:Port %d already forwarded by another login",
+                                        requested_port);
+                                send(conn->fd, error_msg, (int)strlen(error_msg), SEND_FLAGS);
+                                update_rate_limit(ip, 0);
+#ifdef _WIN32
+                                Sleep(1000);
+#else
+                                sleep(1);
+#endif
+                                cleanup_connection(conn);
+                                continue;
+                            }
+
+                            // Check ports per login limit
+                            int current_ports = count_ports_for_login(pass_start);
+                            if (current_ports >= ports_per_login) {
+                                char error_msg[128];
+                                snprintf(error_msg, sizeof(error_msg), "ERROR:Login has reached maximum ports (%d/%d)",
+                                        current_ports, ports_per_login);
+                                send(conn->fd, error_msg, (int)strlen(error_msg), SEND_FLAGS);
+                                update_rate_limit(ip, 0);
+#ifdef _WIN32
+                                Sleep(1000);
+#else
+                                sleep(1);
+#endif
+                                cleanup_connection(conn);
+                                continue;
+                            }
 
                             send(conn->fd, "OK", 2, SEND_FLAGS);
                             conn->state = CONN_STATE_TUNNEL_ESTABLISHED;
@@ -1168,7 +2129,7 @@ static int serve_mode(const char *bind_addr, int tunnel_port) {
                                     close(listen_fd);
                                 } else {
                                     set_nonblocking(listen_fd);
-                                    add_forwarded_port(requested_port, listen_fd, conn->fd, bind_addr);
+                                    add_forwarded_port(requested_port, listen_fd, conn->fd, bind_addr, pass_start);
                                 }
                             }
                         } else {
@@ -1407,7 +2368,7 @@ static int load_forward_config(const char *filename, char *server_addr, int *ser
     while (fgets(line, sizeof(line), f)) {
         // Remove trailing newline
         line[strcspn(line, "\r\n")] = 0;
-        
+
         // Skip comments and empty lines
         if (line[0] == '#' || line[0] == '/' || line[0] == '\0') continue;
 
@@ -1469,7 +2430,7 @@ static int load_server_config(const char *filename, char *bind_addr, int *bind_p
     while (fgets(line, sizeof(line), f)) {
         // Remove trailing newline
         line[strcspn(line, "\r\n")] = 0;
-        
+
         // Skip comments and empty lines
         if (line[0] == '#' || line[0] == '/' || line[0] == '\0') continue;
 
@@ -1490,24 +2451,123 @@ static int load_server_config(const char *filename, char *bind_addr, int *bind_p
             strncpy(passwd, line + 7, 255);
             continue;
         }
+
+        // Parse min_port= line
+        if (strncmp(line, "min_port=", 9) == 0) {
+            min_port = atoi(line + 9);
+            if (min_port < 1) min_port = 1;
+            continue;
+        }
+
+        // Parse max_port= line
+        if (strncmp(line, "max_port=", 9) == 0) {
+            max_port = atoi(line + 9);
+            if (max_port > 65535) max_port = 65535;
+            continue;
+        }
+
+        // Parse ports_per_login= line
+        if (strncmp(line, "ports_per_login=", 16) == 0) {
+            ports_per_login = atoi(line + 16);
+            if (ports_per_login < 1) ports_per_login = 1;
+            if (ports_per_login > MAX_FORWARDED_PORTS) ports_per_login = MAX_FORWARDED_PORTS;
+            continue;
+        }
+
+        // Parse logins_per_ip= line
+        if (strncmp(line, "logins_per_ip=", 14) == 0) {
+            logins_per_ip = atoi(line + 14);
+            if (logins_per_ip < 1) logins_per_ip = 1;
+            continue;
+        }
+
+        // Parse restricted_ports= line
+        if (strncmp(line, "restricted_ports=", 17) == 0) {
+            char *ports_str = line + 17;
+            restricted_port_count = 0;
+            char *token = strtok(ports_str, ",");
+            while (token && restricted_port_count < 256) {
+                restricted_ports[restricted_port_count++] = atoi(token);
+                token = strtok(NULL, ",");
+            }
+            continue;
+        }
     }
 
     fclose(f);
     return (bind_addr[0] != '\0' && *bind_port > 0 && passwd[0] != '\0') ? 1 : 0;
 }
 
+// Helper function to load client config from forwards.conf (tries current dir and parent dir)
+static int load_client_config(char *server_addr, int *server_port, char *username, char *password) {
+    char config_server[256];
+    int config_port = 0;
+    char config_passwd[256];
+    config_passwd[0] = '\0';
+    
+    // Try current directory first, then parent directory
+    if (load_forward_config("forwards.conf", config_server, &config_port, config_passwd) <= 0) {
+        if (load_forward_config("../forwards.conf", config_server, &config_port, config_passwd) <= 0) {
+            // Try srps.conf as fallback for server address only
+            char bind_addr[256];
+            int bind_port;
+            char passwd[256];
+            if (load_server_config("srps.conf", bind_addr, &bind_port, passwd)) {
+                strncpy(server_addr, bind_addr, 255);
+                *server_port = bind_port;
+                return 0; // No credentials but server found
+            } else if (load_server_config("../srps.conf", bind_addr, &bind_port, passwd)) {
+                strncpy(server_addr, bind_addr, 255);
+                *server_port = bind_port;
+                return 0; // No credentials but server found
+            }
+            return -1; // Nothing found
+        }
+    }
+    
+    // Found forwards.conf
+    strncpy(server_addr, config_server, 255);
+    *server_port = config_port;
+    
+    if (config_passwd[0] != '\0') {
+        char *colon = strchr(config_passwd, ':');
+        if (colon) {
+            *colon = '\0';
+            strncpy(username, config_passwd, 255);
+            strncpy(password, colon + 1, 255);
+            return 1; // Found both server and credentials
+        }
+    }
+    
+    return 0; // Found server but no credentials
+}
+
 int main(int argc, char *argv[]) {
     if (argc < 2) {
         printf("Usage:\n");
-        printf("  Server: %s serve <bind_addr>:<tunnel_port> <password>\n", argv[0]);
-        printf("  Agent:  %s forward [<local_port>:<server_port>] [<tunnel_addr>:<tunnel_port>] [<password>]\n", argv[0]);
-        printf("          %s forward  (uses forwards.conf)\n", argv[0]);
+        printf("  Server:     %s serve <bind_addr>:<tunnel_port> <password>\n", argv[0]);
+        printf("  Agent:      %s forward [<local_port>:<server_port>] [<tunnel_addr>:<tunnel_port>] [<password>]\n", argv[0]);
+        printf("              %s forward  (uses forwards.conf)\n", argv[0]);
+        printf("  Claim:      %s claim <port> [<server_addr>:<port>] [<username>:<password>]\n", argv[0]);
+        printf("  Unclaim:    %s unclaim <port> [<server_addr>:<port>] [<username>:<password>]\n", argv[0]);
+        printf("  Register:   %s register <username> <password> [<server_addr>:<port>]\n", argv[0]);
+        printf("  Delete:     %s deleteacc <username> <password> [<server_addr>:<port>]\n", argv[0]);
         return 1;
     }
 
     init_network();
-    memset(connections, 0, sizeof(connections));
-    memset(forwarded_ports, 0, sizeof(forwarded_ports));
+    
+    // Allocate dynamic arrays
+    connections = calloc(MAX_CONNECTIONS, sizeof(connection_t));
+    forwarded_ports = calloc(MAX_FORWARDED_PORTS, sizeof(forwarded_port_t));
+    forward_configs = calloc(MAX_FORWARDED_PORTS, sizeof(forward_config_t));
+    rate_limits = calloc(65536, sizeof(rate_limit_entry_t));
+    restricted_ports = calloc(max_restricted_ports, sizeof(int));
+    
+    if (!connections || !forwarded_ports || !forward_configs || !rate_limits || !restricted_ports) {
+        fprintf(stderr, "Failed to allocate memory\n");
+        return 1;
+    }
     for (int i = 0; i < MAX_CONNECTIONS; i++) {
         connections[i].fd = INVALID_SOCK;
     }
@@ -1673,11 +2733,445 @@ int main(int argc, char *argv[]) {
             Sleep(5000);
         }
 #endif
+    } else if (strcmp(argv[1], "register") == 0) {
+        if (argc < 3) {
+            fprintf(stderr, "Usage: %s register <username> <password> [<server_addr>:<port>]\n", argv[0]);
+            fprintf(stderr, "  If credentials/server not provided, reads from forwards.conf\n");
+            return 1;
+        }
+        
+        char server_addr[256] = "127.0.0.1";
+        int server_port = 6969;
+        char username[256] = "";
+        char user_password[256] = "";
+        
+        // Check if we have username and password from args
+        int has_creds = (argc >= 4);
+        
+        if (has_creds) {
+            strncpy(username, argv[2], sizeof(username) - 1);
+            strncpy(user_password, argv[3], sizeof(user_password) - 1);
+        }
+        
+        // Parse optional server address from args
+        if (argc >= 5) {
+            char *colon = strchr(argv[4], ':');
+            if (colon) {
+                *colon = '\0';
+                strncpy(server_addr, argv[4], sizeof(server_addr) - 1);
+                server_port = atoi(colon + 1);
+            }
+        } else {
+            // Try to load from forwards.conf
+            char config_server[256];
+            int config_port;
+            char config_passwd[256];
+            if (load_forward_config("forwards.conf", config_server, &config_port, config_passwd) > 0) {
+                strncpy(server_addr, config_server, sizeof(server_addr) - 1);
+                server_port = config_port;
+                
+                // If no credentials from args, use from config
+                if (!has_creds && config_passwd[0] != '\0') {
+                    char *colon = strchr(config_passwd, ':');
+                    if (colon) {
+                        *colon = '\0';
+                        strncpy(username, config_passwd, sizeof(username) - 1);
+                        strncpy(user_password, colon + 1, sizeof(user_password) - 1);
+                        has_creds = 1;
+                    }
+                }
+            } else {
+                // Fallback to srps.conf for server address only
+                char bind_addr[256];
+                int bind_port;
+                char passwd[256];
+                if (load_server_config("srps.conf", bind_addr, &bind_port, passwd)) {
+                    strncpy(server_addr, bind_addr, sizeof(server_addr) - 1);
+                    server_port = bind_port;
+                }
+            }
+        }
+        
+        if (!has_creds) {
+            fprintf(stderr, "Username and password required (provide as args or in forwards.conf)\n");
+            return 1;
+        }
+        
+        // Validate password before sending to server
+        char error_msg[256];
+        if (!validate_password(user_password, error_msg, sizeof(error_msg))) {
+            fprintf(stderr, "Password validation failed: %s\n", error_msg);
+            return 1;
+        }
+        
+        // Validate username (no colons or pipes)
+        if (strchr(username, ':') || strchr(username, '|')) {
+            fprintf(stderr, "Username cannot contain ':' or '|'\n");
+            return 1;
+        }
+        
+        // Connect to server
+        socket_t sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock == INVALID_SOCK) {
+            perror("socket");
+            return 1;
+        }
+        
+        struct sockaddr_in sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sin_family = AF_INET;
+        sa.sin_port = htons((unsigned short)server_port);
+        inet_pton(AF_INET, server_addr, &sa.sin_addr);
+        
+        if (connect(sock, (struct sockaddr*)&sa, sizeof(sa)) < 0) {
+            perror("connect");
+            close(sock);
+            return 1;
+        }
+        
+        // Hash password
+        unsigned int hash = simple_hash(user_password);
+        
+        // Send REGISTER command: REGISTER:username:hashed_password
+        char register_msg[512];
+        snprintf(register_msg, sizeof(register_msg), "REGISTER:%s:%u", username, hash);
+        
+        if (send(sock, register_msg, (int)strlen(register_msg), SEND_FLAGS) < 0) {
+            perror("send");
+            close(sock);
+            return 1;
+        }
+        
+        char response[256];
+        int n = recv(sock, response, sizeof(response) - 1, 0);
+        if (n > 0) {
+            response[n] = '\0';
+            printf("%s\n", response);
+            close(sock);
+            return (strncmp(response, "OK", 2) == 0) ? 0 : 1;
+        }
+        
+        close(sock);
+        return 1;
+    } else if (strcmp(argv[1], "deleteacc") == 0) {
+        if (argc < 3) {
+            fprintf(stderr, "Usage: %s deleteacc <username> <password> [<server_addr>:<port>]\n", argv[0]);
+            fprintf(stderr, "  If credentials/server not provided, reads from forwards.conf\n");
+            return 1;
+        }
+        
+        char server_addr[256] = "127.0.0.1";
+        int server_port = 6969;
+        char username[256] = "";
+        char user_password[256] = "";
+        
+        // Check if we have username and password from args
+        int has_creds = (argc >= 4);
+        
+        if (has_creds) {
+            strncpy(username, argv[2], sizeof(username) - 1);
+            strncpy(user_password, argv[3], sizeof(user_password) - 1);
+        }
+        
+        // Parse optional server address from args
+        if (argc >= 5) {
+            char *colon = strchr(argv[4], ':');
+            if (colon) {
+                *colon = '\0';
+                strncpy(server_addr, argv[4], sizeof(server_addr) - 1);
+                server_port = atoi(colon + 1);
+            }
+        } else {
+            // Try to load from forwards.conf
+            char config_server[256];
+            int config_port;
+            char config_passwd[256];
+            if (load_forward_config("forwards.conf", config_server, &config_port, config_passwd) > 0) {
+                strncpy(server_addr, config_server, sizeof(server_addr) - 1);
+                server_port = config_port;
+                
+                // If no credentials from args, use from config
+                if (!has_creds && config_passwd[0] != '\0') {
+                    char *colon = strchr(config_passwd, ':');
+                    if (colon) {
+                        *colon = '\0';
+                        strncpy(username, config_passwd, sizeof(username) - 1);
+                        strncpy(user_password, colon + 1, sizeof(user_password) - 1);
+                        has_creds = 1;
+                    }
+                }
+            } else {
+                // Fallback to srps.conf for server address only
+                char bind_addr[256];
+                int bind_port;
+                char passwd[256];
+                if (load_server_config("srps.conf", bind_addr, &bind_port, passwd)) {
+                    strncpy(server_addr, bind_addr, sizeof(server_addr) - 1);
+                    server_port = bind_port;
+                }
+            }
+        }
+        
+        if (!has_creds) {
+            fprintf(stderr, "Username and password required (provide as args or in forwards.conf)\n");
+            return 1;
+        }
+        
+        // Connect to server
+        socket_t sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock == INVALID_SOCK) {
+            perror("socket");
+            return 1;
+        }
+        
+        struct sockaddr_in sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sin_family = AF_INET;
+        sa.sin_port = htons((unsigned short)server_port);
+        inet_pton(AF_INET, server_addr, &sa.sin_addr);
+        
+        if (connect(sock, (struct sockaddr*)&sa, sizeof(sa)) < 0) {
+            perror("connect");
+            close(sock);
+            return 1;
+        }
+        
+        // Hash password
+        unsigned int hash = simple_hash(user_password);
+        
+        // Send DELETEACC command: DELETEACC:username:hashed_password
+        char delete_msg[512];
+        snprintf(delete_msg, sizeof(delete_msg), "DELETEACC:%s:%u", username, hash);
+        
+        if (send(sock, delete_msg, (int)strlen(delete_msg), SEND_FLAGS) < 0) {
+            perror("send");
+            close(sock);
+            return 1;
+        }
+        
+        char response[256];
+        int n = recv(sock, response, sizeof(response) - 1, 0);
+        if (n > 0) {
+            response[n] = '\0';
+            printf("%s\n", response);
+            close(sock);
+            return (strncmp(response, "OK", 2) == 0) ? 0 : 1;
+        }
+        
+        close(sock);
+        return 1;
+    } else if (strcmp(argv[1], "claim") == 0) {
+        if (argc < 3) {
+            fprintf(stderr, "Usage: %s claim <port> [<server_addr>:<port>] [<username>:<password>]\n", argv[0]);
+            fprintf(stderr, "  If credentials/server not provided, reads from forwards.conf\n");
+            return 1;
+        }
+
+        int claim_port = atoi(argv[2]);
+        char server_addr[256] = "127.0.0.1";
+        int server_port = 6969;
+        char username[256] = "";
+        char passwd[256] = "";
+        int has_creds = 0;
+
+        // Parse optional server address
+        if (argc >= 4) {
+            char *colon = strchr(argv[3], ':');
+            if (colon) {
+                *colon = '\0';
+                strncpy(server_addr, argv[3], sizeof(server_addr) - 1);
+                server_port = atoi(colon + 1);
+            }
+        }
+
+        // Parse optional credentials
+        if (argc >= 5) {
+            char temp_passwd[256];
+            strncpy(temp_passwd, argv[4], sizeof(temp_passwd) - 1);
+            char *colon = strchr(temp_passwd, ':');
+            if (colon) {
+                *colon = '\0';
+                strncpy(username, temp_passwd, sizeof(username) - 1);
+                strncpy(passwd, colon + 1, sizeof(passwd) - 1);
+                has_creds = 1;
+            }
+        }
+        
+        // If no credentials or server provided, try to load from forwards.conf
+        if (!has_creds || argc < 4) {
+            char config_user[256] = "";
+            char config_pass[256] = "";
+            int result = load_client_config(server_addr, &server_port, config_user, config_pass);
+            
+            // Use config credentials if not provided in args
+            if (!has_creds && result > 0) {
+                strncpy(username, config_user, sizeof(username) - 1);
+                strncpy(passwd, config_pass, sizeof(passwd) - 1);
+                has_creds = 1;
+            }
+        }
+        
+        if (!has_creds) {
+            fprintf(stderr, "Username:password required (provide as arg or in forwards.conf)\n");
+            return 1;
+        }
+
+        // Connect to server and send claim request
+        socket_t sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock == INVALID_SOCK) {
+            perror("socket");
+            return 1;
+        }
+
+        struct sockaddr_in sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sin_family = AF_INET;
+        sa.sin_port = htons((unsigned short)server_port);
+        inet_pton(AF_INET, server_addr, &sa.sin_addr);
+
+        if (connect(sock, (struct sockaddr*)&sa, sizeof(sa)) < 0) {
+            perror("connect");
+            close(sock);
+            return 1;
+        }
+
+        // Send claim command: CLAIM:username:hashed_password:port
+        unsigned int hash = simple_hash(passwd);
+        char claim_msg[512];
+        snprintf(claim_msg, sizeof(claim_msg), "CLAIM:%s:%u:%d", username, hash, claim_port);
+
+        if (send(sock, claim_msg, (int)strlen(claim_msg), SEND_FLAGS) < 0) {
+            perror("send");
+            close(sock);
+            return 1;
+        }
+
+        char response[256];
+        int n = recv(sock, response, sizeof(response) - 1, 0);
+        if (n > 0) {
+            response[n] = '\0';
+            printf("%s\n", response);
+            close(sock);
+            return (strncmp(response, "OK", 2) == 0) ? 0 : 1;
+        }
+
+        close(sock);
+        return 1;
+    } else if (strcmp(argv[1], "unclaim") == 0) {
+        if (argc < 3) {
+            fprintf(stderr, "Usage: %s unclaim <port> [<server_addr>:<port>] [<username>:<password>]\n", argv[0]);
+            fprintf(stderr, "  If credentials/server not provided, reads from forwards.conf\n");
+            return 1;
+        }
+
+        int unclaim_port = atoi(argv[2]);
+        char server_addr[256] = "127.0.0.1";
+        int server_port = 6969;
+        char username[256] = "";
+        char passwd[256] = "";
+        int has_creds = 0;
+
+        if (argc >= 4) {
+            char *colon = strchr(argv[3], ':');
+            if (colon) {
+                *colon = '\0';
+                strncpy(server_addr, argv[3], sizeof(server_addr) - 1);
+                server_port = atoi(colon + 1);
+            }
+        }
+
+        if (argc >= 5) {
+            char temp_passwd[256];
+            strncpy(temp_passwd, argv[4], sizeof(temp_passwd) - 1);
+            char *colon = strchr(temp_passwd, ':');
+            if (colon) {
+                *colon = '\0';
+                strncpy(username, temp_passwd, sizeof(username) - 1);
+                strncpy(passwd, colon + 1, sizeof(passwd) - 1);
+                has_creds = 1;
+            }
+        }
+        
+        // If no credentials or server provided, try to load from forwards.conf
+        if (!has_creds || argc < 4) {
+            char config_server[256];
+            int config_port;
+            char config_passwd[256];
+            if (load_forward_config("forwards.conf", config_server, &config_port, config_passwd) > 0) {
+                if (argc < 4) {
+                    strncpy(server_addr, config_server, sizeof(server_addr) - 1);
+                    server_port = config_port;
+                }
+                
+                if (!has_creds && config_passwd[0] != '\0') {
+                    char *colon = strchr(config_passwd, ':');
+                    if (colon) {
+                        *colon = '\0';
+                        strncpy(username, config_passwd, sizeof(username) - 1);
+                        strncpy(passwd, colon + 1, sizeof(passwd) - 1);
+                        has_creds = 1;
+                    }
+                }
+            }
+        }
+        
+        if (!has_creds) {
+            fprintf(stderr, "Username:password required (provide as arg or in forwards.conf)\n");
+            return 1;
+        }
+
+        socket_t sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock == INVALID_SOCK) {
+            perror("socket");
+            return 1;
+        }
+
+        struct sockaddr_in sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sin_family = AF_INET;
+        sa.sin_port = htons((unsigned short)server_port);
+        inet_pton(AF_INET, server_addr, &sa.sin_addr);
+
+        if (connect(sock, (struct sockaddr*)&sa, sizeof(sa)) < 0) {
+            perror("connect");
+            close(sock);
+            return 1;
+        }
+
+        unsigned int hash = simple_hash(passwd);
+        char unclaim_msg[512];
+        snprintf(unclaim_msg, sizeof(unclaim_msg), "UNCLAIM:%s:%u:%d", username, hash, unclaim_port);
+
+        if (send(sock, unclaim_msg, (int)strlen(unclaim_msg), SEND_FLAGS) < 0) {
+            perror("send");
+            close(sock);
+            return 1;
+        }
+
+        char response[256];
+        int n = recv(sock, response, sizeof(response) - 1, 0);
+        if (n > 0) {
+            response[n] = '\0';
+            printf("%s\n", response);
+            close(sock);
+            return (strncmp(response, "OK", 2) == 0) ? 0 : 1;
+        }
+
+        close(sock);
+        return 1;
     } else {
         fprintf(stderr, "Unknown mode: %s\n", argv[1]);
         return 1;
     }
 
     cleanup_network();
+    
+    // Free dynamic arrays
+    free(connections);
+    free(forwarded_ports);
+    free(forward_configs);
+    free(rate_limits);
+    free(restricted_ports);
+    
     return 0;
 }
