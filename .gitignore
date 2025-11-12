@@ -9,4 +9,7 @@ srp
 *.swo
 *~
 
-
+# Config files
+*.conf
+*.json
+*.jsonc
