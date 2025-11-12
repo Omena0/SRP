@@ -19,6 +19,7 @@ all: $(TARGET)
 
 $(TARGET): main.c
 	$(CC) $(CFLAGS) -o $(TARGET) main.c $(LDFLAGS)
+	chmod +x srp
 
 clean:
 	del /Q $(TARGET) 2>nul || rm -f $(TARGET)
