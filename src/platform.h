@@ -3,6 +3,11 @@
 
 /* Cross-platform socket and threading abstractions */
 
+#ifndef _WIN32
+/* Expose POSIX APIs like strnlen, nanosleep, select, timeval, etc. */
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #ifdef _WIN32
     #define WIN32_LEAN_AND_MEAN
     #include <winsock2.h>
@@ -108,6 +113,11 @@
     #include <fcntl.h>
     #include <errno.h>
     #include <pthread.h>
+    /* For select(), fd_set, timeval */
+    #include <sys/select.h>
+    #include <sys/time.h>
+    /* For nanosleep */
+    #include <time.h>
 
     typedef int socket_t;
     typedef pthread_t thread_t;
@@ -180,7 +190,10 @@
     }
 
     static inline void platform_sleep_ms(int ms) {
-        usleep(ms * 1000);
+        struct timespec ts;
+        ts.tv_sec = ms / 1000;
+        ts.tv_nsec = (ms % 1000) * 1000000;
+        nanosleep(&ts, NULL);
     }
 #endif
 
