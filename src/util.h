@@ -3,57 +3,60 @@
 
 #include <stddef.h>
 #include <stdint.h>
-#include <stdbool.h>
 
-typedef struct {
-    char *data;
-    size_t len;
-    size_t cap;
-} String;
-
-typedef struct {
-    const char *key;
-    void *value;
-} HashEntry;
-
-typedef struct {
-    HashEntry *entries;
-    size_t cap;
-    size_t len;
-} HashMap;
+/* Forward declarations */
+struct sockaddr_in;
 
 /* String utilities */
-String string_new(size_t cap);
-void string_free(String *s);
-void string_append(String *s, const char *data, size_t len);
-void string_append_cstr(String *s, const char *cstr);
-char *string_cstr(String *s);
-String string_from_cstr(const char *cstr);
-
-/* HashMap utilities */
-HashMap *hashmap_new(size_t cap);
-void hashmap_free(HashMap *map);
-void hashmap_set(HashMap *map, const char *key, void *value);
-void *hashmap_get(HashMap *map, const char *key);
-bool hashmap_contains(HashMap *map, const char *key);
-void hashmap_remove(HashMap *map, const char *key);
-
-/* File utilities */
-char *read_file(const char *path, size_t *out_len);
-bool write_file(const char *path, const char *data, size_t len);
-bool file_exists(const char *path);
-
-/* String parsing */
-char **split_string(const char *str, char delim, size_t *out_count);
-void free_split_string(char **parts, size_t count);
-char *trim_string(const char *str);
-bool parse_addr(const char *addr, char *out_host, size_t host_len, uint16_t *out_port);
-uint16_t parse_port(const char *str);
+char* str_trim(char* str);
+char* str_dup(const char* str);
+int str_split(const char* str, char delim, char*** out, int* count);
+void str_free_split(char** arr, int count);
+int str_to_int(const char* str, int* out);
+int str_to_uint16(const char* str, uint16_t* out);
+int parse_port_list(const char* str, uint16_t** ports, int* count);
 
 /* Memory utilities */
-void *xmalloc(size_t size);
-void *xcalloc(size_t count, size_t size);
-void *xrealloc(void *ptr, size_t size);
-char *xstrdup(const char *str);
+void* xmalloc(size_t size);
+void* xcalloc(size_t nmemb, size_t size);
+void* xrealloc(void* ptr, size_t size);
+void xfree(void* ptr);
 
-#endif
+/* Logging */
+void log_init(const char* filename);
+void log_close(void);
+void log_info(const char* fmt, ...);
+void log_warn(const char* fmt, ...);
+void log_error(const char* fmt, ...);
+void log_debug(const char* fmt, ...);
+
+/* Time utilities */
+uint64_t get_timestamp(void);
+void format_timestamp(uint64_t ts, char* buf, size_t size);
+
+/* File utilities */
+int file_exists(const char* path);
+long file_size(const char* path);
+char* file_read_all(const char* path, size_t* size);
+
+/* Buffer utilities */
+typedef struct {
+    uint8_t* data;
+    size_t size;
+    size_t capacity;
+    size_t read_pos;
+} buffer_t;
+
+buffer_t* buffer_create(size_t initial_capacity);
+void buffer_free(buffer_t* buf);
+int buffer_write(buffer_t* buf, const uint8_t* data, size_t len);
+int buffer_read(buffer_t* buf, uint8_t* data, size_t len);
+size_t buffer_available(const buffer_t* buf);
+void buffer_compact(buffer_t* buf);
+void buffer_clear(buffer_t* buf);
+
+/* Network utilities */
+int parse_address(const char* addr, char* host, size_t host_len, uint16_t* port);
+int resolve_address(const char* host, uint16_t port, struct sockaddr_in* addr);
+
+#endif /* UTIL_H */

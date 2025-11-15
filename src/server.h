@@ -1,30 +1,12 @@
 #ifndef SERVER_H
 #define SERVER_H
 
-#include <stdint.h>
-#include <stddef.h>
-#include <stdbool.h>
-#include <time.h>
-#include "credentials.h"
+#include "platform.h"
 #include "config.h"
+#include "credentials.h"
+#include <stdint.h>
 
-typedef struct {
-    int socket_fd;
-    char username[256];
-    bool authenticated;
-} ServerClient;
+/* Start the server */
+int server_run(const char* config_path);
 
-/* Protocol commands (newline-delimited) */
-#define CMD_AUTH "AUTH"
-#define CMD_CLAIM "CLAIM"
-#define CMD_UNCLAIM "UNCLAIM"
-#define CMD_LIST "LIST"
-#define CMD_QUIT "QUIT"
-
-/* Response codes */
-#define RESP_OK "OK"
-#define RESP_ERR "ERR"
-
-int server_run(ServerConfig *cfg, LoginStore *store);
-
-#endif
+#endif /* SERVER_H */

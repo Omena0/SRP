@@ -2,45 +2,47 @@
 #define CONFIG_H
 
 #include <stdint.h>
-#include <stdbool.h>
-#include <stddef.h>
 
+/* Server configuration */
 typedef struct {
-    char *host;
+    char host[256];
     uint16_t port;
+    /* Dedicated data port for agent data socket connections (optional). If 0, uses port+1 */
+    uint16_t data_port;
     uint16_t min_port;
     uint16_t max_port;
-    uint16_t ports_per_login;
-    uint16_t logins_per_ip;
-    char *restricted_ports; /* comma-separated */
-} ServerConfig;
+    int ports_per_login;
+    int logins_per_ip;
+    uint16_t* restricted_ports;
+    int restricted_count;
+} server_config_t;
 
+/* Forward mapping */
 typedef struct {
-    char *server_host;
+    uint16_t remote_port;
+    uint16_t local_port;
+} forward_mapping_t;
+
+/* Agent configuration */
+typedef struct {
+    char server_host[256];
     uint16_t server_port;
-    char *username;
-    char *password;
-    struct {
-        uint16_t remote;
-        uint16_t local;
-    } *forwards;
-    size_t forward_count;
-    size_t forward_cap;
-} ClientConfig;
+    char username[64];
+    char password[128];
+    forward_mapping_t* forwards;
+    int forward_count;
+} agent_config_t;
 
-/* Parse server config from file */
-ServerConfig *config_parse_server(const char *path);
+/* Configuration loading */
+int config_load_server(const char* path, server_config_t* config);
+int config_load_agent(const char* path, agent_config_t* config);
 
-/* Parse client config from file */
-ClientConfig *config_parse_client(const char *path);
+/* Configuration cleanup */
+void config_free_server(server_config_t* config);
+void config_free_agent(agent_config_t* config);
 
-/* Free server config */
-void config_free_server(ServerConfig *cfg);
+/* Default configuration paths */
+#define DEFAULT_SERVER_CONFIG "srps.conf"
+#define DEFAULT_AGENT_CONFIG "forwards.conf"
 
-/* Free client config */
-void config_free_client(ClientConfig *cfg);
-
-/* Check if port is restricted */
-bool config_port_restricted(ServerConfig *cfg, uint16_t port);
-
-#endif
+#endif /* CONFIG_H */

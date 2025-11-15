@@ -1,274 +1,191 @@
 #include "forward.h"
-#include <stdio.h>
+#include "protocol.h"
+#include "util.h"
+#include "platform.h"
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <netdb.h>
-#include <fcntl.h>
-#include <errno.h>
-#include <signal.h>
 
-#define BUFFER_SIZE 4096
-#define MAX_CONNECTIONS 256
+/* ZERO overhead - dedicated data socket sends raw bytes! */
+#define FORWARD_BUFFER_SIZE (64 * 1024)  /* 64KB for maximum throughput */
 
-typedef struct {
-    int client_fd;
-    int server_fd;
-    char client_buf[BUFFER_SIZE];
-    size_t client_buf_len;
-    char server_buf[BUFFER_SIZE];
-    size_t server_buf_len;
-} Connection;
-
-typedef struct {
-    Connection connections[MAX_CONNECTIONS];
-    int conn_count;
-} ConnectionPool;
-
-static int socket_connect(const char *host, uint16_t port) {
-    struct addrinfo hints = {0};
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
+/* Forward data bidirectionally between server data socket and local service */
+void* tunnel_worker(void* arg) {
+    tunnel_connection_t* conn = (tunnel_connection_t*)arg;
     
-    char port_str[16];
-    sprintf(port_str, "%u", port);
+    uint8_t buffer[FORWARD_BUFFER_SIZE];
+    fd_set read_fds, write_fds;
+    struct timeval timeout;
     
-    struct addrinfo *result;
-    if (getaddrinfo(host, port_str, &hints, &result) != 0)
-        return -1;
+    log_debug("Tunnel worker %u started with dedicated data socket", conn->tunnel_id);
     
-    int fd = -1;
-    for (struct addrinfo *rp = result; rp != NULL; rp = rp->ai_next) {
-        fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
-        if (fd == -1)
-            continue;
+    while (conn->active) {
+        FD_ZERO(&read_fds);
+        FD_ZERO(&write_fds);
+        FD_SET(conn->local_sock, &read_fds);
+        FD_SET(conn->data_sock, &read_fds);
         
-        if (connect(fd, rp->ai_addr, rp->ai_addrlen) == 0)
-            break;
+        /* Monitor for write if we have buffered data */
+        mutex_lock(&conn->write_mutex);
+        int has_write_data = conn->write_buffer_size > 0;
+        mutex_unlock(&conn->write_mutex);
         
-        close(fd);
-        fd = -1;
-    }
-    
-    freeaddrinfo(result);
-    return fd;
-}
-
-static int socket_listen(const char *bind_host, uint16_t bind_port) {
-    struct addrinfo hints = {0};
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_flags = AI_PASSIVE;
-    
-    char port_str[16];
-    sprintf(port_str, "%u", bind_port);
-    
-    struct addrinfo *result;
-    if (getaddrinfo(bind_host, port_str, &hints, &result) != 0)
-        return -1;
-    
-    int fd = -1;
-    for (struct addrinfo *rp = result; rp != NULL; rp = rp->ai_next) {
-        fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
-        if (fd == -1)
-            continue;
-        
-        int opt = 1;
-        if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) == -1) {
-            close(fd);
-            continue;
+        if (has_write_data) {
+            FD_SET(conn->local_sock, &write_fds);
         }
         
-        if (bind(fd, rp->ai_addr, rp->ai_addrlen) == 0)
+        timeout.tv_sec = 0;
+        timeout.tv_usec = 1000; /* 1ms - low latency without excessive CPU */
+        
+        socket_t max_fd = conn->local_sock > conn->data_sock ? conn->local_sock : conn->data_sock;
+        int ready = select(max_fd + 1, &read_fds, &write_fds, NULL, &timeout);
+        
+        if (ready < 0) {
+            log_error("select() failed in tunnel worker: %d", socket_errno);
             break;
+        }
         
-        close(fd);
-        fd = -1;
-    }
-    
-    freeaddrinfo(result);
-    
-    if (fd == -1)
-        return -1;
-    
-    if (listen(fd, 128) == -1) {
-        close(fd);
-        return -1;
-    }
-    
-    return fd;
-}
-
-static void set_nonblocking(int fd) {
-    int flags = fcntl(fd, F_GETFL, 0);
-    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-}
-
-static bool relay_data(int from, int to, char *buf, size_t *buf_len) {
-    (void)from;
-    if (*buf_len == 0)
-        return true;
-    
-    ssize_t written = send(to, buf, *buf_len, MSG_NOSIGNAL);
-    if (written < 0) {
-        if (errno != EAGAIN && errno != EWOULDBLOCK)
-            return false;
-        return true;
-    }
-    
-    if (written < (ssize_t)*buf_len) {
-        memmove(buf, buf + written, *buf_len - written);
-        *buf_len -= written;
-        return true;
-    }
-    
-    *buf_len = 0;
-    return true;
-}
-
-bool proxy_ports(const char *bind_addr, uint16_t bind_port,
-                 const char *dest_host, uint16_t dest_port) {
-    if (!bind_addr || !dest_host)
-        return false;
-    
-    int listen_fd = socket_listen(bind_addr, bind_port);
-    if (listen_fd == -1) {
-        perror("socket_listen");
-        return false;
-    }
-    
-    set_nonblocking(listen_fd);
-    ConnectionPool pool = {0};
-    
-    fprintf(stderr, "Forwarding %s:%u -> %s:%u\n", bind_addr, bind_port,
-            dest_host, dest_port);
-    
-    while (1) {
-        fd_set readfds, writefds;
-        int max_fd = listen_fd;
+        if (ready == 0) continue; /* Timeout */
         
-        FD_ZERO(&readfds);
-        FD_ZERO(&writefds);
-        FD_SET(listen_fd, &readfds);
-        
-        for (int i = 0; i < pool.conn_count; i++) {
-            Connection *conn = &pool.connections[i];
-            if (conn->client_fd != -1) {
-                FD_SET(conn->client_fd, &readfds);
-                max_fd = (conn->client_fd > max_fd) ? conn->client_fd : max_fd;
+        /* Flush write buffer to local service if writable */
+        if (FD_ISSET(conn->local_sock, &write_fds)) {
+            mutex_lock(&conn->write_mutex);
+            if (conn->write_buffer_size > 0) {
+                int sent = send(conn->local_sock, (const char*)conn->write_buffer,
+                              conn->write_buffer_size, MSG_NOSIGNAL);
+                if (sent > 0) {
+                    memmove(conn->write_buffer, conn->write_buffer + sent,
+                           conn->write_buffer_size - sent);
+                    conn->write_buffer_size -= sent;
+                } else if (sent < 0 && !socket_would_block(socket_errno)) {
+                    log_error("Failed to write to local service: %d", socket_errno);
+                    mutex_unlock(&conn->write_mutex);
+                    break;
+                }
             }
-            
-            if (conn->server_fd != -1) {
-                if (conn->client_buf_len > 0)
-                    FD_SET(conn->server_fd, &writefds);
-                else
-                    FD_SET(conn->server_fd, &readfds);
+            mutex_unlock(&conn->write_mutex);
+        }
+        
+        /* Data from local service -> send to server data socket (ZERO OVERHEAD!) */
+        if (FD_ISSET(conn->local_sock, &read_fds)) {
+            int consecutive = 0;
+            while (consecutive < 10 && conn->active) {
+                int received = recv(conn->local_sock, (char*)buffer, sizeof(buffer), 0);
                 
-                max_fd = (conn->server_fd > max_fd) ? conn->server_fd : max_fd;
-            }
-        }
-        
-        struct timeval tv = {.tv_sec = 1, .tv_usec = 0};
-        int select_res = select(max_fd + 1, &readfds, &writefds, NULL, &tv);
-        
-        if (select_res == -1) {
-            perror("select");
-            break;
-        }
-        
-        /* Accept new connections */
-        if (FD_ISSET(listen_fd, &readfds)) {
-            int client_fd = accept(listen_fd, NULL, NULL);
-            if (client_fd != -1) {
-                if (pool.conn_count >= MAX_CONNECTIONS) {
-                    close(client_fd);
-                } else {
-                    int server_fd = socket_connect(dest_host, dest_port);
-                    if (server_fd != -1) {
-                        set_nonblocking(client_fd);
-                        set_nonblocking(server_fd);
-                        
-                        Connection *conn = &pool.connections[pool.conn_count++];
-                        conn->client_fd = client_fd;
-                        conn->server_fd = server_fd;
-                        conn->client_buf_len = 0;
-                        conn->server_buf_len = 0;
-                    } else {
-                        close(client_fd);
+                if (received < 0) {
+                    int err = socket_errno;
+                    if (!socket_would_block(err)) {
+                        log_error("Local connection error: %d", err);
+                        goto cleanup;
                     }
+                    break; /* No more data */
+                } else if (received == 0) {
+                    log_info("Local connection closed (tunnel %u)", conn->tunnel_id);
+                    goto cleanup;
+                } else {
+                    /* Send raw bytes directly - NO protocol overhead! */
+                    size_t sent = 0;
+                    while (sent < (size_t)received) {
+                        int s = send(conn->data_sock, (const char*)buffer + sent,
+                                   received - sent, MSG_NOSIGNAL);
+                        if (s < 0) {
+                            if (!socket_would_block(socket_errno)) {
+                                log_error("Failed to send to server: %d", socket_errno);
+                                goto cleanup;
+                            }
+                            /* Wait briefly for socket to be writable */
+                            fd_set wfds;
+                            FD_ZERO(&wfds);
+                            FD_SET(conn->data_sock, &wfds);
+                            struct timeval tv = {5, 0};
+                            if (select(conn->data_sock + 1, NULL, &wfds, NULL, &tv) <= 0) {
+                                log_error("Send timeout");
+                                goto cleanup;
+                            }
+                            continue;
+                        }
+                        sent += s;
+                    }
+                    consecutive++;
                 }
             }
         }
         
-        /* Process existing connections */
-        for (int i = 0; i < pool.conn_count; ) {
-            Connection *conn = &pool.connections[i];
-            bool close_conn = false;
+        /* Data from server data socket -> send to local service (ZERO OVERHEAD!) */
+        if (FD_ISSET(conn->data_sock, &read_fds)) {
+            int received = recv(conn->data_sock, (char*)buffer, sizeof(buffer), 0);
             
-            if (FD_ISSET(conn->client_fd, &readfds)) {
-                ssize_t n = recv(conn->client_fd, conn->client_buf + conn->client_buf_len,
-                                BUFFER_SIZE - conn->client_buf_len, 0);
-                if (n <= 0) {
-                    close_conn = true;
-                } else {
-                    conn->client_buf_len += n;
+            if (received < 0) {
+                int err = socket_errno;
+                if (!socket_would_block(err)) {
+                    log_error("Server data socket error: %d", err);
+                    break;
                 }
-            }
-            
-            if (FD_ISSET(conn->server_fd, &readfds)) {
-                ssize_t n = recv(conn->server_fd, conn->server_buf + conn->server_buf_len,
-                                BUFFER_SIZE - conn->server_buf_len, 0);
-                if (n <= 0) {
-                    close_conn = true;
-                } else {
-                    conn->server_buf_len += n;
-                }
-            }
-            
-            if (FD_ISSET(conn->server_fd, &writefds)) {
-                if (!relay_data(conn->client_fd, conn->server_fd,
-                               conn->client_buf, &conn->client_buf_len)) {
-                    close_conn = true;
-                }
-            }
-            
-            /* Send buffered server data to client */
-            if (conn->server_buf_len > 0) {
-                ssize_t written = send(conn->client_fd, conn->server_buf,
-                                      conn->server_buf_len, MSG_NOSIGNAL);
-                if (written < 0) {
-                    if (errno != EAGAIN && errno != EWOULDBLOCK)
-                        close_conn = true;
-                } else {
-                    if (written < (ssize_t)conn->server_buf_len) {
-                        memmove(conn->server_buf, conn->server_buf + written,
-                               conn->server_buf_len - written);
-                    }
-                    conn->server_buf_len -= written;
-                }
-            }
-            
-            if (close_conn) {
-                if (conn->client_fd != -1)
-                    close(conn->client_fd);
-                if (conn->server_fd != -1)
-                    close(conn->server_fd);
-                
-                if (i < pool.conn_count - 1) {
-                    memmove(conn, conn + 1,
-                           (pool.conn_count - i - 1) * sizeof(Connection));
-                }
-                pool.conn_count--;
+            } else if (received == 0) {
+                log_info("Server closed data socket (tunnel %u)", conn->tunnel_id);
+                break;
             } else {
-                i++;
+                /* Send raw bytes to local service */
+                mutex_lock(&conn->write_mutex);
+                
+                /* Try direct send first */
+                if (conn->write_buffer_size == 0) {
+                    int sent = send(conn->local_sock, (const char*)buffer, received, MSG_NOSIGNAL);
+                    if (sent > 0) {
+                        if (sent < received) {
+                            /* Buffer remainder */
+                            size_t remaining = received - sent;
+                            if (remaining > conn->write_buffer_capacity) {
+                                conn->write_buffer_capacity = remaining * 2;
+                                conn->write_buffer = (uint8_t*)xrealloc(conn->write_buffer,
+                                                                       conn->write_buffer_capacity);
+                            }
+                            memcpy(conn->write_buffer, buffer + sent, remaining);
+                            conn->write_buffer_size = remaining;
+                        }
+                        mutex_unlock(&conn->write_mutex);
+                        continue;
+                    }
+                }
+                
+                /* Buffer all data */
+                size_t new_size = conn->write_buffer_size + received;
+                if (new_size > conn->write_buffer_capacity) {
+                    conn->write_buffer_capacity = new_size * 2;
+                    if (conn->write_buffer_capacity > 134217728) {
+                        log_error("Write buffer overflow (tunnel %u)", conn->tunnel_id);
+                        mutex_unlock(&conn->write_mutex);
+                        break;
+                    }
+                    conn->write_buffer = (uint8_t*)xrealloc(conn->write_buffer,
+                                                           conn->write_buffer_capacity);
+                }
+                memcpy(conn->write_buffer + conn->write_buffer_size, buffer, received);
+                conn->write_buffer_size += received;
+                mutex_unlock(&conn->write_mutex);
             }
         }
     }
     
-    close(listen_fd);
-    return true;
+cleanup:
+    socket_close(conn->local_sock);
+    socket_close(conn->data_sock);
+    conn->active = 0;
+    
+    /* Free write buffer */
+    mutex_lock(&conn->write_mutex);
+    if (conn->write_buffer) {
+        xfree(conn->write_buffer);
+        conn->write_buffer = NULL;
+    }
+    conn->write_buffer_size = 0;
+    conn->write_buffer_capacity = 0;
+    mutex_unlock(&conn->write_mutex);
+    
+    log_debug("Tunnel worker finished for tunnel %u", conn->tunnel_id);
+    
+#ifdef _WIN32
+    return 0;
+#else
+    return NULL;
+#endif
 }

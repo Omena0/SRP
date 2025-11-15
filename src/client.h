@@ -1,31 +1,14 @@
 #ifndef CLIENT_H
 #define CLIENT_H
 
-#include <stdint.h>
-#include <stdbool.h>
+#include "config.h"
 
-typedef struct {
-    int socket_fd;
-    char *username;
-    char *password;
-    char *server_host;
-    uint16_t server_port;
-} SRPClient;
+/* Start the agent/client */
+int client_run(const char* config_path);
 
-/* Connect and authenticate to SRP server */
-SRPClient *client_connect(const char *host, uint16_t port,
-                          const char *username, const char *password);
+/* Admin commands */
+int client_claim_port(const char* config_path, uint16_t port);
+int client_unclaim_port(const char* config_path, uint16_t port);
+int client_list_ports(const char* config_path);
 
-/* Disconnect from server */
-void client_disconnect(SRPClient *client);
-
-/* Claim a port on the server */
-bool client_claim_port(SRPClient *client, uint16_t port);
-
-/* Unclaim a port */
-bool client_unclaim_port(SRPClient *client, uint16_t port);
-
-/* List all claimed ports */
-char *client_list_ports(SRPClient *client);
-
-#endif
+#endif /* CLIENT_H */

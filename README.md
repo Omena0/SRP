@@ -11,13 +11,6 @@
 - Per-user allocation limit
 - Tests
 
-## Todo
-
-- Public web panel?
-- Bandwidth/packet rate limit?
-- Log file config
-- Make sure it actually works
-
 ## Usage
 
 ```sh

@@ -1,385 +1,403 @@
 #include "util.h"
+#include "platform.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdio.h>
 #include <ctype.h>
+#include <time.h>
+#include <stdarg.h>
 
-/* ============== Memory utilities ============== */
+#ifdef _WIN32
+    #include <sys/stat.h>
+#else
+    #include <sys/stat.h>
+    #include <sys/time.h>
+#endif
 
-void *xmalloc(size_t size) {
-    void *ptr = malloc(size);
-    if (!ptr && size > 0) {
-        fprintf(stderr, "fatal: malloc failed\n");
+/* ========== String Utilities ========== */
+
+char* str_trim(char* str) {
+    if (!str) return NULL;
+    
+    /* Trim leading space */
+    while (isspace((unsigned char)*str)) str++;
+    
+    if (*str == 0) return str;
+    
+    /* Trim trailing space */
+    char* end = str + strlen(str) - 1;
+    while (end > str && isspace((unsigned char)*end)) end--;
+    end[1] = '\0';
+    
+    return str;
+}
+
+char* str_dup(const char* str) {
+    if (!str) return NULL;
+    size_t len = strlen(str);
+    char* dup = (char*)xmalloc(len + 1);
+    memcpy(dup, str, len + 1);
+    return dup;
+}
+
+int str_split(const char* str, char delim, char*** out, int* count) {
+    if (!str || !out || !count) return -1;
+    
+    /* Count delimiters */
+    int n = 1;
+    for (const char* p = str; *p; p++) {
+        if (*p == delim) n++;
+    }
+    
+    *out = (char**)xmalloc(n * sizeof(char*));
+    *count = 0;
+    
+    const char* start = str;
+    const char* end;
+    
+    while ((end = strchr(start, delim)) != NULL) {
+        size_t len = end - start;
+        (*out)[*count] = (char*)xmalloc(len + 1);
+        memcpy((*out)[*count], start, len);
+        (*out)[*count][len] = '\0';
+        (*count)++;
+        start = end + 1;
+    }
+    
+    /* Last segment */
+    (*out)[*count] = str_dup(start);
+    (*count)++;
+    
+    return 0;
+}
+
+void str_free_split(char** arr, int count) {
+    if (!arr) return;
+    for (int i = 0; i < count; i++) {
+        xfree(arr[i]);
+    }
+    xfree(arr);
+}
+
+int str_to_int(const char* str, int* out) {
+    if (!str || !out) return -1;
+    char* endptr;
+    long val = strtol(str, &endptr, 10);
+    if (*endptr != '\0') return -1;
+    *out = (int)val;
+    return 0;
+}
+
+int str_to_uint16(const char* str, uint16_t* out) {
+    if (!str || !out) return -1;
+    char* endptr;
+    long val = strtol(str, &endptr, 10);
+    if (*endptr != '\0' || val < 0 || val > 65535) return -1;
+    *out = (uint16_t)val;
+    return 0;
+}
+
+/* Parse comma-separated list of ports */
+int parse_port_list(const char* str, uint16_t** ports, int* count) {
+    if (!str || !ports || !count) return -1;
+    
+    /* Empty list */
+    if (strlen(str) == 0) {
+        *ports = NULL;
+        *count = 0;
+        return 0;
+    }
+    
+    char** parts;
+    int n;
+    if (str_split(str, ',', &parts, &n) != 0) return -1;
+    
+    *ports = (uint16_t*)xmalloc(n * sizeof(uint16_t));
+    *count = 0;
+    
+    for (int i = 0; i < n; i++) {
+        uint16_t port;
+        if (str_to_uint16(str_trim(parts[i]), &port) == 0) {
+            (*ports)[*count] = port;
+            (*count)++;
+        }
+    }
+    
+    str_free_split(parts, n);
+    return 0;
+}
+
+/* ========== Memory Utilities ========== */
+
+void* xmalloc(size_t size) {
+    void* ptr = malloc(size);
+    if (!ptr && size != 0) {
+        log_error("Out of memory (malloc %zu bytes)", size);
         exit(1);
     }
     return ptr;
 }
 
-void *xcalloc(size_t count, size_t size) {
-    void *ptr = calloc(count, size);
-    if (!ptr && (count * size) > 0) {
-        fprintf(stderr, "fatal: calloc failed\n");
+void* xcalloc(size_t nmemb, size_t size) {
+    void* ptr = calloc(nmemb, size);
+    if (!ptr && nmemb != 0 && size != 0) {
+        log_error("Out of memory (calloc %zu * %zu bytes)", nmemb, size);
         exit(1);
     }
     return ptr;
 }
 
-void *xrealloc(void *ptr, size_t size) {
-    void *new_ptr = realloc(ptr, size);
-    if (!new_ptr && size > 0) {
-        fprintf(stderr, "fatal: realloc failed\n");
+void* xrealloc(void* ptr, size_t size) {
+    void* new_ptr = realloc(ptr, size);
+    if (!new_ptr && size != 0) {
+        log_error("Out of memory (realloc %zu bytes)", size);
         exit(1);
     }
     return new_ptr;
 }
 
-char *xstrdup(const char *str) {
-    if (!str)
-        return NULL;
-    size_t len = strlen(str) + 1;
-    char *dup = xmalloc(len);
-    memcpy(dup, str, len);
-    return dup;
+void xfree(void* ptr) {
+    free(ptr);
 }
 
-/* ============== String utilities ============== */
+/* ========== Logging ========== */
 
-String string_new(size_t cap) {
-    if (cap == 0)
-        cap = 32;
-    return (String){
-        .data = xmalloc(cap),
-        .len = 0,
-        .cap = cap,
-    };
-}
+static FILE* log_file = NULL;
+static mutex_t log_mutex;
+static int log_initialized = 0;
 
-void string_free(String *s) {
-    if (s && s->data) {
-        free(s->data);
-        s->data = NULL;
-        s->len = 0;
-        s->cap = 0;
-    }
-}
-
-void string_append(String *s, const char *data, size_t len) {
-    if (!s || !data || len == 0)
-        return;
+void log_init(const char* filename) {
+    if (log_initialized) return;
     
-    while (s->len + len >= s->cap) {
-        s->cap *= 2;
-        s->data = xrealloc(s->data, s->cap);
-    }
+    mutex_init(&log_mutex);
     
-    memcpy(s->data + s->len, data, len);
-    s->len += len;
-}
-
-void string_append_cstr(String *s, const char *cstr) {
-    if (cstr)
-        string_append(s, cstr, strlen(cstr));
-}
-
-char *string_cstr(String *s) {
-    if (!s || !s->data)
-        return NULL;
-    
-    if (s->len >= s->cap) {
-        s->cap = s->len + 1;
-        s->data = xrealloc(s->data, s->cap);
-    }
-    
-    s->data[s->len] = '\0';
-    return s->data;
-}
-
-String string_from_cstr(const char *cstr) {
-    if (!cstr)
-        return string_new(0);
-    
-    String s = string_new(strlen(cstr) + 1);
-    string_append_cstr(&s, cstr);
-    return s;
-}
-
-/* ============== HashMap utilities ============== */
-
-static size_t hash_djb2(const char *str) {
-    size_t hash = 5381;
-    int c;
-    while ((c = (unsigned char)*str++))
-        hash = ((hash << 5) + hash) + c;
-    return hash;
-}
-
-HashMap *hashmap_new(size_t cap) {
-    if (cap == 0)
-        cap = 16;
-    
-    HashMap *map = xmalloc(sizeof(HashMap));
-    map->entries = xcalloc(cap, sizeof(HashEntry));
-    map->cap = cap;
-    map->len = 0;
-    return map;
-}
-
-void hashmap_free(HashMap *map) {
-    if (!map)
-        return;
-    
-    for (size_t i = 0; i < map->cap; i++) {
-        if (map->entries[i].key) {
-            free((void *)map->entries[i].key);
+    if (filename) {
+        log_file = fopen(filename, "a");
+        if (!log_file) {
+            fprintf(stderr, "Warning: Could not open log file %s\n", filename);
+            log_file = stderr;
         }
-    }
-    free(map->entries);
-    free(map);
-}
-
-void hashmap_set(HashMap *map, const char *key, void *value) {
-    if (!map || !key)
-        return;
-    
-    /* Simple linear probing hash table */
-    size_t idx = hash_djb2(key) % map->cap;
-    
-    for (size_t i = 0; i < map->cap; i++) {
-        size_t pos = (idx + i) % map->cap;
-        
-        if (!map->entries[pos].key) {
-            map->entries[pos].key = xstrdup(key);
-            map->entries[pos].value = value;
-            map->len++;
-            return;
-        }
-        
-        if (strcmp(map->entries[pos].key, key) == 0) {
-            map->entries[pos].value = value;
-            return;
-        }
+    } else {
+        log_file = stderr;
     }
     
-    /* Rehash if no space found (shouldn't happen) */
-    fprintf(stderr, "warning: hashmap full, cannot insert\n");
+    log_initialized = 1;
 }
 
-void *hashmap_get(HashMap *map, const char *key) {
-    if (!map || !key)
-        return NULL;
+void log_close(void) {
+    if (!log_initialized) return;
     
-    size_t idx = hash_djb2(key) % map->cap;
-    
-    for (size_t i = 0; i < map->cap; i++) {
-        size_t pos = (idx + i) % map->cap;
-        
-        if (!map->entries[pos].key)
-            return NULL;
-        
-        if (strcmp(map->entries[pos].key, key) == 0)
-            return map->entries[pos].value;
+    if (log_file && log_file != stderr) {
+        fclose(log_file);
     }
     
-    return NULL;
+    mutex_destroy(&log_mutex);
+    log_initialized = 0;
 }
 
-bool hashmap_contains(HashMap *map, const char *key) {
-    return hashmap_get(map, key) != NULL;
+static void log_write(const char* level, const char* fmt, va_list args) {
+    if (!log_initialized) log_init(NULL);
+    
+    mutex_lock(&log_mutex);
+    
+    time_t now = time(NULL);
+    struct tm* tm_info = localtime(&now);
+    char time_buf[32];
+    strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", tm_info);
+    
+    fprintf(log_file, "[%s] [%s] ", time_buf, level);
+    vfprintf(log_file, fmt, args);
+    fprintf(log_file, "\n");
+    fflush(log_file);
+    
+    mutex_unlock(&log_mutex);
 }
 
-void hashmap_remove(HashMap *map, const char *key) {
-    if (!map || !key)
-        return;
-    
-    size_t idx = hash_djb2(key) % map->cap;
-    
-    for (size_t i = 0; i < map->cap; i++) {
-        size_t pos = (idx + i) % map->cap;
-        
-        if (!map->entries[pos].key)
-            return;
-        
-        if (strcmp(map->entries[pos].key, key) == 0) {
-            free((void *)map->entries[pos].key);
-            map->entries[pos].key = NULL;
-            map->entries[pos].value = NULL;
-            map->len--;
-            return;
-        }
-    }
+void log_info(const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    log_write("INFO", fmt, args);
+    va_end(args);
 }
 
-/* ============== File utilities ============== */
+void log_warn(const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    log_write("WARN", fmt, args);
+    va_end(args);
+}
 
-char *read_file(const char *path, size_t *out_len) {
-    if (!path)
-        return NULL;
-    
-    FILE *f = fopen(path, "rb");
-    if (!f)
-        return NULL;
+void log_error(const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    log_write("ERROR", fmt, args);
+    va_end(args);
+}
+
+void log_debug(const char* fmt, ...) {
+#ifdef DEBUG
+    va_list args;
+    va_start(args, fmt);
+    log_write("DEBUG", fmt, args);
+    va_end(args);
+#else
+    (void)fmt; /* Suppress unused parameter warning */
+#endif
+}
+
+/* ========== Time Utilities ========== */
+
+uint64_t get_timestamp(void) {
+#ifdef _WIN32
+    return (uint64_t)time(NULL);
+#else
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (uint64_t)tv.tv_sec;
+#endif
+}
+
+void format_timestamp(uint64_t ts, char* buf, size_t size) {
+    time_t t = (time_t)ts;
+    struct tm* tm_info = localtime(&t);
+    strftime(buf, size, "%Y-%m-%d %H:%M:%S", tm_info);
+}
+
+/* ========== File Utilities ========== */
+
+int file_exists(const char* path) {
+    struct stat st;
+    return stat(path, &st) == 0;
+}
+
+long file_size(const char* path) {
+    struct stat st;
+    if (stat(path, &st) != 0) return -1;
+    return (long)st.st_size;
+}
+
+char* file_read_all(const char* path, size_t* size) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return NULL;
     
     fseek(f, 0, SEEK_END);
-    long size = ftell(f);
+    long fsize = ftell(f);
     fseek(f, 0, SEEK_SET);
     
-    if (size < 0) {
+    if (fsize < 0) {
         fclose(f);
         return NULL;
     }
     
-    char *data = xmalloc(size + 1);
-    size_t read = fread(data, 1, size, f);
+    char* content = (char*)xmalloc(fsize + 1);
+    size_t read = fread(content, 1, fsize, f);
     fclose(f);
     
-    if ((long)read != size) {
-        free(data);
-        return NULL;
+    content[read] = '\0';
+    if (size) *size = read;
+    
+    return content;
+}
+
+/* ========== Buffer Utilities ========== */
+
+buffer_t* buffer_create(size_t initial_capacity) {
+    buffer_t* buf = (buffer_t*)xmalloc(sizeof(buffer_t));
+    buf->capacity = initial_capacity > 0 ? initial_capacity : 4096;
+    buf->data = (uint8_t*)xmalloc(buf->capacity);
+    buf->size = 0;
+    buf->read_pos = 0;
+    return buf;
+}
+
+void buffer_free(buffer_t* buf) {
+    if (!buf) return;
+    xfree(buf->data);
+    xfree(buf);
+}
+
+int buffer_write(buffer_t* buf, const uint8_t* data, size_t len) {
+    if (!buf || !data) return -1;
+    
+    /* Ensure capacity */
+    while (buf->size + len > buf->capacity) {
+        buf->capacity *= 2;
+        buf->data = (uint8_t*)xrealloc(buf->data, buf->capacity);
     }
     
-    data[size] = '\0';
-    if (out_len)
-        *out_len = size;
-    
-    return data;
+    memcpy(buf->data + buf->size, data, len);
+    buf->size += len;
+    return 0;
 }
 
-bool write_file(const char *path, const char *data, size_t len) {
-    if (!path || !data)
-        return false;
+int buffer_read(buffer_t* buf, uint8_t* data, size_t len) {
+    if (!buf || !data) return -1;
     
-    FILE *f = fopen(path, "wb");
-    if (!f)
-        return false;
+    size_t available = buf->size - buf->read_pos;
+    if (len > available) len = available;
     
-    size_t written = fwrite(data, 1, len, f);
-    fclose(f);
-    
-    return written == len;
+    memcpy(data, buf->data + buf->read_pos, len);
+    buf->read_pos += len;
+    return (int)len;
 }
 
-bool file_exists(const char *path) {
-    if (!path)
-        return false;
+size_t buffer_available(const buffer_t* buf) {
+    if (!buf) return 0;
+    return buf->size - buf->read_pos;
+}
+
+void buffer_compact(buffer_t* buf) {
+    if (!buf || buf->read_pos == 0) return;
     
-    FILE *f = fopen(path, "r");
-    if (f) {
-        fclose(f);
-        return true;
+    size_t available = buf->size - buf->read_pos;
+    if (available > 0) {
+        memmove(buf->data, buf->data + buf->read_pos, available);
     }
-    return false;
+    buf->size = available;
+    buf->read_pos = 0;
 }
 
-/* ============== String parsing ============== */
-
-char **split_string(const char *str, char delim, size_t *out_count) {
-    if (!str) {
-        if (out_count) *out_count = 0;
-        return NULL;
-    }
-    
-    size_t cap = 10;
-    size_t len = 0;
-    char **parts = xmalloc(cap * sizeof(char *));
-    
-    const char *start = str;
-    const char *end = str;
-    
-    while (*end) {
-        if (*end == delim) {
-            size_t part_len = end - start;
-            char *part = xmalloc(part_len + 1);
-            memcpy(part, start, part_len);
-            part[part_len] = '\0';
-            
-            if (len >= cap) {
-                cap *= 2;
-                parts = xrealloc(parts, cap * sizeof(char *));
-            }
-            parts[len++] = part;
-            
-            start = end + 1;
-        }
-        end++;
-    }
-    
-    /* Last part */
-    size_t part_len = end - start;
-    if (part_len > 0) {
-        char *part = xmalloc(part_len + 1);
-        memcpy(part, start, part_len);
-        part[part_len] = '\0';
-        
-        if (len >= cap) {
-            cap *= 2;
-            parts = xrealloc(parts, cap * sizeof(char *));
-        }
-        parts[len++] = part;
-    }
-    
-    if (out_count)
-        *out_count = len;
-    
-    return parts;
+void buffer_clear(buffer_t* buf) {
+    if (!buf) return;
+    buf->size = 0;
+    buf->read_pos = 0;
 }
 
-void free_split_string(char **parts, size_t count) {
-    if (!parts)
-        return;
-    
-    for (size_t i = 0; i < count; i++)
-        free(parts[i]);
-    
-    free(parts);
-}
+/* ========== Network Utilities ========== */
 
-char *trim_string(const char *str) {
-    if (!str)
-        return xstrdup("");
+int parse_address(const char* addr, char* host, size_t host_len, uint16_t* port) {
+    if (!addr || !host || !port) return -1;
     
-    while (isspace((unsigned char)*str))
-        str++;
+    /* Find colon */
+    const char* colon = strchr(addr, ':');
+    if (!colon) return -1;
     
-    const char *end = str + strlen(str);
-    while (end > str && isspace((unsigned char)*(end - 1)))
-        end--;
-    
-    size_t len = end - str;
-    char *trimmed = xmalloc(len + 1);
-    memcpy(trimmed, str, len);
-    trimmed[len] = '\0';
-    
-    return trimmed;
-}
-
-bool parse_addr(const char *addr, char *out_host, size_t host_len, uint16_t *out_port) {
-    if (!addr || !out_host || !out_port)
-        return false;
-    
-    const char *colon = strrchr(addr, ':');
-    if (!colon)
-        return false;
-    
+    /* Extract host */
     size_t host_size = colon - addr;
-    if (host_size == 0 || host_size >= host_len)
-        return false;
+    if (host_size >= host_len) return -1;
+    memcpy(host, addr, host_size);
+    host[host_size] = '\0';
     
-    memcpy(out_host, addr, host_size);
-    out_host[host_size] = '\0';
-    
-    *out_port = parse_port(colon + 1);
-    return *out_port > 0;
+    /* Extract port */
+    return str_to_uint16(colon + 1, port);
 }
 
-uint16_t parse_port(const char *str) {
-    if (!str)
+int resolve_address(const char* host, uint16_t port, struct sockaddr_in* addr) {
+    if (!host || !addr) return -1;
+    
+    memset(addr, 0, sizeof(*addr));
+    addr->sin_family = AF_INET;
+    addr->sin_port = htons(port);
+    
+    /* Try as IP address first */
+    if (inet_pton(AF_INET, host, &addr->sin_addr) == 1) {
         return 0;
+    }
     
-    char *end;
-    long port = strtol(str, &end, 10);
+    /* Resolve hostname */
+    struct hostent* he = gethostbyname(host);
+    if (!he) return -1;
     
-    if (*end != '\0' || port < 1 || port > 65535)
-        return 0;
-    
-    return (uint16_t)port;
+    memcpy(&addr->sin_addr, he->h_addr_list[0], he->h_length);
+    return 0;
 }
