@@ -12,7 +12,8 @@
 void* tunnel_worker(void* arg) {
     tunnel_connection_t* conn = (tunnel_connection_t*)arg;
     
-    uint8_t buffer[FORWARD_BUFFER_SIZE];
+    uint8_t buffer_local[FORWARD_BUFFER_SIZE];  /* Local->Server buffer */
+    uint8_t buffer_server[FORWARD_BUFFER_SIZE]; /* Server->Local buffer */
     fd_set read_fds, write_fds;
     struct timeval timeout;
     
@@ -65,7 +66,7 @@ void* tunnel_worker(void* arg) {
         
         /* Data from local service -> send to server data socket (ZERO OVERHEAD!) */
         if (FD_ISSET(conn->local_sock, &read_fds)) {
-            int received = recv(conn->local_sock, (char*)buffer, sizeof(buffer), 0);
+            int received = recv(conn->local_sock, (char*)buffer_local, sizeof(buffer_local), 0);
             
             if (received < 0) {
                 int err = socket_errno;
@@ -80,7 +81,7 @@ void* tunnel_worker(void* arg) {
                 /* Send raw bytes directly - NO protocol overhead! */
                 size_t sent = 0;
                 while (sent < (size_t)received) {
-                    int s = send(conn->data_sock, (const char*)buffer + sent,
+                    int s = send(conn->data_sock, (const char*)buffer_local + sent,
                                received - sent, MSG_NOSIGNAL);
                     if (s < 0) {
                         if (!socket_would_block(socket_errno)) {
@@ -105,7 +106,7 @@ void* tunnel_worker(void* arg) {
         
         /* Data from server data socket -> send to local service (ZERO OVERHEAD!) */
         if (FD_ISSET(conn->data_sock, &read_fds)) {
-            int received = recv(conn->data_sock, (char*)buffer, sizeof(buffer), 0);
+            int received = recv(conn->data_sock, (char*)buffer_server, sizeof(buffer_server), 0);
             
             if (received < 0) {
                 int err = socket_errno;
@@ -122,7 +123,7 @@ void* tunnel_worker(void* arg) {
                 
                 /* Try direct send first */
                 if (conn->write_buffer_size == 0) {
-                    int sent = send(conn->local_sock, (const char*)buffer, received, MSG_NOSIGNAL);
+                    int sent = send(conn->local_sock, (const char*)buffer_server, received, MSG_NOSIGNAL);
                     if (sent > 0) {
                         if (sent < received) {
                             /* Buffer remainder */
@@ -132,7 +133,7 @@ void* tunnel_worker(void* arg) {
                                 conn->write_buffer = (uint8_t*)xrealloc(conn->write_buffer,
                                                                        conn->write_buffer_capacity);
                             }
-                            memcpy(conn->write_buffer, buffer + sent, remaining);
+                            memcpy(conn->write_buffer, buffer_server + sent, remaining);
                             conn->write_buffer_size = remaining;
                         }
                         mutex_unlock(&conn->write_mutex);
@@ -149,7 +150,7 @@ void* tunnel_worker(void* arg) {
                             conn->write_buffer = (uint8_t*)xrealloc(conn->write_buffer,
                                                                    conn->write_buffer_capacity);
                         }
-                        memcpy(conn->write_buffer + conn->write_buffer_size, buffer, received);
+                        memcpy(conn->write_buffer + conn->write_buffer_size, buffer_server, received);
                         conn->write_buffer_size += received;
                         mutex_unlock(&conn->write_mutex);
                     }
@@ -166,7 +167,7 @@ void* tunnel_worker(void* arg) {
                         conn->write_buffer = (uint8_t*)xrealloc(conn->write_buffer,
                                                                conn->write_buffer_capacity);
                     }
-                    memcpy(conn->write_buffer + conn->write_buffer_size, buffer, received);
+                    memcpy(conn->write_buffer + conn->write_buffer_size, buffer_server, received);
                     conn->write_buffer_size += received;
                     mutex_unlock(&conn->write_mutex);
                 }
