@@ -26,12 +26,10 @@ void* tunnel_worker(void* arg) {
         
         /* Monitor for write if we have buffered data */
         mutex_lock(&conn->write_mutex);
-        int has_write_data = conn->write_buffer_size > 0;
-        mutex_unlock(&conn->write_mutex);
-        
-        if (has_write_data) {
+        if (conn->write_buffer_size > 0) {
             FD_SET(conn->local_sock, &write_fds);
         }
+        mutex_unlock(&conn->write_mutex);
         
         timeout.tv_sec = 0;
         timeout.tv_usec = 1000; /* 1ms - low latency without excessive CPU */
@@ -138,25 +136,40 @@ void* tunnel_worker(void* arg) {
                             conn->write_buffer_size = remaining;
                         }
                         mutex_unlock(&conn->write_mutex);
-                        continue;
-                    }
-                }
-                
-                /* Buffer all data */
-                size_t new_size = conn->write_buffer_size + received;
-                if (new_size > conn->write_buffer_capacity) {
-                    conn->write_buffer_capacity = new_size * 2;
-                    if (conn->write_buffer_capacity > 134217728) {
-                        log_error("Write buffer overflow (tunnel %u)", conn->tunnel_id);
+                    } else {
+                        /* Buffer all data if direct send failed */
+                        size_t new_size = conn->write_buffer_size + received;
+                        if (new_size > conn->write_buffer_capacity) {
+                            conn->write_buffer_capacity = new_size * 2;
+                            if (conn->write_buffer_capacity > 134217728) {
+                                log_error("Write buffer overflow (tunnel %u)", conn->tunnel_id);
+                                mutex_unlock(&conn->write_mutex);
+                                break;
+                            }
+                            conn->write_buffer = (uint8_t*)xrealloc(conn->write_buffer,
+                                                                   conn->write_buffer_capacity);
+                        }
+                        memcpy(conn->write_buffer + conn->write_buffer_size, buffer, received);
+                        conn->write_buffer_size += received;
                         mutex_unlock(&conn->write_mutex);
-                        break;
                     }
-                    conn->write_buffer = (uint8_t*)xrealloc(conn->write_buffer,
-                                                           conn->write_buffer_capacity);
+                } else {
+                    /* Buffer all data if write buffer already has data */
+                    size_t new_size = conn->write_buffer_size + received;
+                    if (new_size > conn->write_buffer_capacity) {
+                        conn->write_buffer_capacity = new_size * 2;
+                        if (conn->write_buffer_capacity > 134217728) {
+                            log_error("Write buffer overflow (tunnel %u)", conn->tunnel_id);
+                            mutex_unlock(&conn->write_mutex);
+                            break;
+                        }
+                        conn->write_buffer = (uint8_t*)xrealloc(conn->write_buffer,
+                                                               conn->write_buffer_capacity);
+                    }
+                    memcpy(conn->write_buffer + conn->write_buffer_size, buffer, received);
+                    conn->write_buffer_size += received;
+                    mutex_unlock(&conn->write_mutex);
                 }
-                memcpy(conn->write_buffer + conn->write_buffer_size, buffer, received);
-                conn->write_buffer_size += received;
-                mutex_unlock(&conn->write_mutex);
             }
         }
     }
