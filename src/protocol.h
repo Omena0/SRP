@@ -25,6 +25,7 @@
 #define MSG_FORWARD     0x0A
 #define MSG_PING        0x0B
 #define MSG_PONG        0x0C
+#define MSG_REGISTER    0x0D
 
 /* Message header size: type(1) + length(4) */
 #define MSG_HEADER_SIZE 5
@@ -128,6 +129,10 @@ int message_parse_error(const message_t* msg, error_payload_t* error);
 /* PING/PONG - application-level keepalive */
 message_t* message_create_ping(void);
 message_t* message_create_pong(void);
+
+/* REGISTER */
+message_t* message_create_register(const char* username, const char* password);
+int message_parse_register(const message_t* msg, auth_payload_t* payload);
 
 /* Send/Receive */
 int message_send(int sock, const message_t* msg);

@@ -88,6 +88,7 @@ static void handle_claim(server_state_t* srv, int client_idx, const message_t* m
 static void handle_unclaim(server_state_t* srv, int client_idx, const message_t* msg);
 static void handle_list(server_state_t* srv, int client_idx, const message_t* msg);
 static void handle_forward(server_state_t* srv, int client_idx, const message_t* msg);
+static void handle_register(server_state_t* srv, int client_idx, const message_t* msg);
 
 /* Signal handler */
 #ifdef _WIN32
@@ -546,6 +547,61 @@ static void handle_forward(server_state_t* srv, int client_idx, const message_t*
     message_free(ok);
 }
 
+/* Handle REGISTER */
+static void handle_register(server_state_t* srv, int client_idx, const message_t* msg) {
+    client_t* client = &srv->clients[client_idx];
+    
+    auth_payload_t reg;
+    if (message_parse_register(msg, &reg) != 0) {
+        log_error("Failed to parse REGISTER message");
+        message_t* err = message_create_error("Invalid REGISTER message");
+        message_send(client->sock, err);
+        message_free(err);
+        close_client(srv, client_idx);
+        return;
+    }
+    
+    /* Validate username and password */
+    if (strlen(reg.username) == 0 || strlen(reg.password) == 0) {
+        log_warn("Registration failed: empty username or password");
+        message_t* err = message_create_error("Username and password cannot be empty");
+        message_send(client->sock, err);
+        message_free(err);
+        close_client(srv, client_idx);
+        return;
+    }
+    
+    /* Check if user already exists */
+    if (login_store_find_user(srv->login_store, reg.username) != NULL) {
+        log_warn("Registration failed: user %s already exists", reg.username);
+        message_t* err = message_create_error("Username already exists");
+        message_send(client->sock, err);
+        message_free(err);
+        close_client(srv, client_idx);
+        return;
+    }
+    
+    /* Add user to login store */
+    if (login_store_add_user(srv->login_store, reg.username, reg.password) != 0) {
+        log_error("Failed to register user: %s", reg.username);
+        message_t* err = message_create_error("Failed to create user account");
+        message_send(client->sock, err);
+        message_free(err);
+        close_client(srv, client_idx);
+        return;
+    }
+    
+    log_info("User registered: %s", reg.username);
+    
+    /* Send OK and close connection */
+    message_t* ok = message_create_ok();
+    message_send(client->sock, ok);
+    message_free(ok);
+    
+    /* Close connection after registration */
+    close_client(srv, client_idx);
+}
+
 /* Handle client message */
 static void handle_client_message(server_state_t* srv, int client_idx) {
     client_t* client = &srv->clients[client_idx];
@@ -585,6 +641,9 @@ static void handle_client_message(server_state_t* srv, int client_idx) {
                 break;
             case MSG_FORWARD:
                 handle_forward(srv, client_idx, msg);
+                break;
+            case MSG_REGISTER:
+                handle_register(srv, client_idx, msg);
                 break;
             case MSG_PING:
                 /* Respond with PONG */

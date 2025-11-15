@@ -138,6 +138,27 @@ message_t* message_create_pong(void) {
     return message_create(MSG_PONG, 0);
 }
 
+message_t* message_create_register(const char* username, const char* password) {
+    /* REGISTER uses same format as AUTH: <username>\0<password> */
+    if (!username || !password) return NULL;
+    
+    size_t username_len = strlen(username);
+    size_t password_len = strlen(password);
+    
+    if (username_len >= MAX_USERNAME_LEN || password_len >= MAX_PASSWORD_LEN) {
+        log_error("Username or password too long");
+        return NULL;
+    }
+    
+    uint32_t length = username_len + 1 + password_len + 1;
+    message_t* msg = message_create(MSG_REGISTER, length);
+    
+    memcpy(msg->payload, username, username_len + 1);
+    memcpy(msg->payload + username_len + 1, password, password_len + 1);
+    
+    return msg;
+}
+
 /* ========== Message Parsing ========== */
 
 int message_parse_auth(const message_t* msg, auth_payload_t* auth) {
@@ -157,6 +178,28 @@ int message_parse_auth(const message_t* msg, auth_payload_t* auth) {
     strncpy(auth->password, password, MAX_PASSWORD_LEN - 1);
     auth->username[MAX_USERNAME_LEN - 1] = '\0';
     auth->password[MAX_PASSWORD_LEN - 1] = '\0';
+    
+    return 0;
+}
+
+int message_parse_register(const message_t* msg, auth_payload_t* payload) {
+    /* REGISTER uses same format as AUTH */
+    if (!msg || !payload || msg->type != MSG_REGISTER) return -1;
+    
+    const char* username = (const char*)msg->payload;
+    size_t username_len = strnlen(username, msg->length);
+    
+    if (username_len >= msg->length || username_len >= MAX_USERNAME_LEN) return -1;
+    
+    const char* password = username + username_len + 1;
+    size_t password_len = strnlen(password, msg->length - username_len - 1);
+    
+    if (password_len >= MAX_PASSWORD_LEN) return -1;
+    
+    strncpy(payload->username, username, MAX_USERNAME_LEN - 1);
+    strncpy(payload->password, password, MAX_PASSWORD_LEN - 1);
+    payload->username[MAX_USERNAME_LEN - 1] = '\0';
+    payload->password[MAX_PASSWORD_LEN - 1] = '\0';
     
     return 0;
 }

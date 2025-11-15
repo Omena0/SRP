@@ -41,16 +41,79 @@ static int cmd_register(int argc, char** argv) {
         return 1;
     }
     
-    login_store_t* store = login_store_create("logins.conf");
-    login_store_load(store);
+    /* Load agent config to get server address */
+    agent_config_t config;
+    if (config_load_agent(DEFAULT_AGENT_CONFIG, &config) != 0) {
+        fprintf(stderr, "Failed to load agent config (%s)\n", DEFAULT_AGENT_CONFIG);
+        return 1;
+    }
     
-    if (login_store_add_user(store, username, password) == 0) {
+    /* Connect to server */
+    socket_t sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock == INVALID_SOCKET_VALUE) {
+        fprintf(stderr, "Failed to create socket: %d\n", socket_errno);
+        config_free_agent(&config);
+        return 1;
+    }
+    
+    struct sockaddr_in addr;
+    if (resolve_address(config.server_host, config.server_port, &addr) != 0) {
+        fprintf(stderr, "Failed to resolve server address: %s:%u\n", config.server_host, config.server_port);
+        socket_close(sock);
+        config_free_agent(&config);
+        return 1;
+    }
+    
+    if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        fprintf(stderr, "Failed to connect to server: %d\n", socket_errno);
+        socket_close(sock);
+        config_free_agent(&config);
+        return 1;
+    }
+    
+    printf("Connected to server %s:%u\n", config.server_host, config.server_port);
+    config_free_agent(&config);
+    
+    /* Send REGISTER message */
+    message_t* reg_msg = message_create_register(username, password);
+    if (!reg_msg) {
+        fprintf(stderr, "Failed to create REGISTER message\n");
+        socket_close(sock);
+        return 1;
+    }
+    
+    if (message_send(sock, reg_msg) != 0) {
+        fprintf(stderr, "Failed to send REGISTER message\n");
+        message_free(reg_msg);
+        socket_close(sock);
+        return 1;
+    }
+    message_free(reg_msg);
+    
+    /* Receive response */
+    message_t* resp = message_receive(sock);
+    if (!resp) {
+        fprintf(stderr, "Failed to receive response from server\n");
+        socket_close(sock);
+        return 1;
+    }
+    
+    if (resp->type == MSG_OK) {
         printf("User registered successfully: %s\n", username);
-        login_store_free(store);
+        message_free(resp);
+        socket_close(sock);
         return 0;
+    } else if (resp->type == MSG_ERR) {
+        error_payload_t err;
+        message_parse_error(resp, &err);
+        fprintf(stderr, "Registration failed: %s\n", err.error);
+        message_free(resp);
+        socket_close(sock);
+        return 1;
     } else {
-        fprintf(stderr, "Failed to register user\n");
-        login_store_free(store);
+        fprintf(stderr, "Unexpected response from server: 0x%02x\n", resp->type);
+        message_free(resp);
+        socket_close(sock);
         return 1;
     }
 }
