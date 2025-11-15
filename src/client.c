@@ -197,6 +197,10 @@ static void handle_tunnel_open(agent_state_t* agent, const message_t* msg) {
     setsockopt(local_sock, SOL_SOCKET, SO_RCVBUF, (const char*)&bufsize, sizeof(bufsize));
     setsockopt(local_sock, SOL_SOCKET, SO_SNDBUF, (const char*)&bufsize, sizeof(bufsize));
     
+    /* Disable Nagle's algorithm - critical for protocol packet boundaries! */
+    int nodelay = 1;
+    setsockopt(local_sock, IPPROTO_TCP, TCP_NODELAY, (const char*)&nodelay, sizeof(nodelay));
+    
     /* Enable TCP keepalive to detect dead connections */
     int keepalive = 1;
     setsockopt(local_sock, SOL_SOCKET, SO_KEEPALIVE, (const char*)&keepalive, sizeof(keepalive));

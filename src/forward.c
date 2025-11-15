@@ -52,6 +52,7 @@ void* tunnel_worker(void* arg) {
                 int sent = send(conn->local_sock, (const char*)conn->write_buffer,
                               conn->write_buffer_size, MSG_NOSIGNAL);
                 if (sent > 0) {
+                    log_debug("Tunnel %u: Flushed %d/%zu buffered bytes", conn->tunnel_id, sent, conn->write_buffer_size);
                     memmove(conn->write_buffer, conn->write_buffer + sent,
                            conn->write_buffer_size - sent);
                     conn->write_buffer_size -= sent;
@@ -78,6 +79,7 @@ void* tunnel_worker(void* arg) {
                 log_info("Local connection closed (tunnel %u)", conn->tunnel_id);
                 goto cleanup;
             } else {
+                log_debug("Tunnel %u: Forwarding %d bytes local->server", conn->tunnel_id, received);
                 /* Send raw bytes directly - NO protocol overhead! */
                 size_t sent = 0;
                 while (sent < (size_t)received) {
@@ -101,6 +103,7 @@ void* tunnel_worker(void* arg) {
                     }
                     sent += s;
                 }
+                log_debug("Tunnel %u: Sent all %d bytes local->server", conn->tunnel_id, received);
             }
         }
         
@@ -118,6 +121,7 @@ void* tunnel_worker(void* arg) {
                 log_info("Server closed data socket (tunnel %u)", conn->tunnel_id);
                 break;
             } else {
+                log_debug("Tunnel %u: Forwarding %d bytes server->local", conn->tunnel_id, received);
                 /* Send raw bytes to local service */
                 mutex_lock(&conn->write_mutex);
                 
@@ -125,9 +129,11 @@ void* tunnel_worker(void* arg) {
                 if (conn->write_buffer_size == 0) {
                     int sent = send(conn->local_sock, (const char*)buffer_server, received, MSG_NOSIGNAL);
                     if (sent > 0) {
+                        log_debug("Tunnel %u: Direct sent %d/%d bytes server->local", conn->tunnel_id, sent, received);
                         if (sent < received) {
                             /* Buffer remainder */
                             size_t remaining = received - sent;
+                            log_debug("Tunnel %u: Buffering %zu remaining bytes", conn->tunnel_id, remaining);
                             if (remaining > conn->write_buffer_capacity) {
                                 conn->write_buffer_capacity = remaining * 2;
                                 conn->write_buffer = (uint8_t*)xrealloc(conn->write_buffer,
@@ -138,6 +144,7 @@ void* tunnel_worker(void* arg) {
                         }
                         mutex_unlock(&conn->write_mutex);
                     } else {
+                        log_debug("Tunnel %u: Direct send failed, buffering all %d bytes", conn->tunnel_id, received);
                         /* Buffer all data if direct send failed */
                         size_t new_size = conn->write_buffer_size + received;
                         if (new_size > conn->write_buffer_capacity) {
@@ -155,6 +162,7 @@ void* tunnel_worker(void* arg) {
                         mutex_unlock(&conn->write_mutex);
                     }
                 } else {
+                    log_debug("Tunnel %u: Buffer has %zu bytes, appending %d bytes", conn->tunnel_id, conn->write_buffer_size, received);
                     /* Buffer all data if write buffer already has data */
                     size_t new_size = conn->write_buffer_size + received;
                     if (new_size > conn->write_buffer_capacity) {
