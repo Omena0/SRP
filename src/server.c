@@ -821,6 +821,25 @@ static void handle_tunnel_data(server_state_t* srv, int tunnel_idx) {
 
     log_info("Tunnel %u: Forwarding %d bytes client->agent", tunnel->tunnel_id, received);
 
+    /* If buffer has data, append new data to maintain order */
+    if (tunnel->to_agent_buffer_size > 0) {
+        size_t new_size = tunnel->to_agent_buffer_size + received;
+        if (new_size > tunnel->to_agent_buffer_capacity) {
+            tunnel->to_agent_buffer_capacity = new_size * 2;
+            if (tunnel->to_agent_buffer_capacity == 0) tunnel->to_agent_buffer_capacity = 65536;
+            if (tunnel->to_agent_buffer_capacity > 134217728) {
+                log_error("Tunnel %u to-agent buffer overflow", tunnel->tunnel_id);
+                close_tunnel(srv, tunnel_idx);
+                return;
+            }
+            tunnel->to_agent_buffer = (uint8_t*)xrealloc(tunnel->to_agent_buffer,
+                                                         tunnel->to_agent_buffer_capacity);
+        }
+        memcpy(tunnel->to_agent_buffer + tunnel->to_agent_buffer_size, buffer, received);
+        tunnel->to_agent_buffer_size += received;
+        return;
+    }
+
     /* Send raw bytes directly to agent data socket - ZERO OVERHEAD! */
     size_t total_sent = 0;
     while (total_sent < (size_t)received) {
@@ -878,6 +897,25 @@ static void handle_agent_tunnel_data(server_state_t* srv, int tunnel_idx) {
     }
 
     log_info("Tunnel %u: Forwarding %d bytes agent->client", tunnel->tunnel_id, received);
+
+    /* If buffer has data, append new data to maintain order */
+    if (tunnel->to_client_buffer_size > 0) {
+        size_t new_size = tunnel->to_client_buffer_size + received;
+        if (new_size > tunnel->to_client_buffer_capacity) {
+            tunnel->to_client_buffer_capacity = new_size * 2;
+            if (tunnel->to_client_buffer_capacity == 0) tunnel->to_client_buffer_capacity = 65536;
+            if (tunnel->to_client_buffer_capacity > 134217728) {
+                log_error("Tunnel %u to-client buffer overflow", tunnel->tunnel_id);
+                close_tunnel(srv, tunnel_idx);
+                return;
+            }
+            tunnel->to_client_buffer = (uint8_t*)xrealloc(tunnel->to_client_buffer,
+                                                          tunnel->to_client_buffer_capacity);
+        }
+        memcpy(tunnel->to_client_buffer + tunnel->to_client_buffer_size, buffer, received);
+        tunnel->to_client_buffer_size += received;
+        return;
+    }
 
     //log_debug("Received %d bytes from agent on tunnel %u", received, tunnel->tunnel_id);
 
