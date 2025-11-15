@@ -324,7 +324,7 @@ static void handle_tunnel_open(agent_state_t* agent, const message_t* msg) {
         socket_close(local_sock);
         socket_close(data_sock);
         /* Inform server to close tunnel */
-        message_t* close_msg = message_create_data(tunnel_id, NULL, 0);
+        message_t* close_msg = message_create_tunnel_close(tunnel_id);
         message_send(agent->server_sock, close_msg);
         message_free(close_msg);
         return;
