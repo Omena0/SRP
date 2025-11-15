@@ -819,8 +819,6 @@ static void handle_tunnel_data(server_state_t* srv, int tunnel_idx) {
         return;
     }
 
-    log_info("Tunnel %u: Forwarding %d bytes client->agent", tunnel->tunnel_id, received);
-
     /* If buffer has data, append new data to maintain order */
     if (tunnel->to_agent_buffer_size > 0) {
         size_t new_size = tunnel->to_agent_buffer_size + received;
@@ -895,8 +893,6 @@ static void handle_agent_tunnel_data(server_state_t* srv, int tunnel_idx) {
         }
         return;
     }
-
-    log_info("Tunnel %u: Forwarding %d bytes agent->client", tunnel->tunnel_id, received);
 
     /* If buffer has data, append new data to maintain order */
     if (tunnel->to_client_buffer_size > 0) {
