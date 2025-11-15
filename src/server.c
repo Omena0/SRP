@@ -645,6 +645,22 @@ static void handle_client_message(server_state_t* srv, int client_idx) {
             case MSG_REGISTER:
                 handle_register(srv, client_idx, msg);
                 break;
+            case MSG_TUNNEL_CLOSE:
+                /* Agent is notifying us to close a tunnel (e.g., failed to connect data socket) */
+                {
+                    tunnel_close_payload_t payload;
+                    if (message_parse_tunnel_close(msg, &payload) == 0) {
+                        /* Find and close the tunnel */
+                        for (int i = 0; i < MAX_TUNNELS; i++) {
+                            if (srv->tunnels[i].active && srv->tunnels[i].tunnel_id == payload.tunnel_id) {
+                                log_info("Agent requested close of tunnel %u", payload.tunnel_id);
+                                close_tunnel(srv, i);
+                                break;
+                            }
+                        }
+                    }
+                }
+                break;
             case MSG_PING:
                 /* Respond with PONG */
                 {
