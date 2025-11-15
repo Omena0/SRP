@@ -819,6 +819,8 @@ static void handle_tunnel_data(server_state_t* srv, int tunnel_idx) {
         return;
     }
 
+    log_info("Tunnel %u: Forwarding %d bytes client->agent", tunnel->tunnel_id, received);
+
     /* Send raw bytes directly to agent data socket - ZERO OVERHEAD! */
     size_t total_sent = 0;
     while (total_sent < (size_t)received) {
@@ -874,6 +876,8 @@ static void handle_agent_tunnel_data(server_state_t* srv, int tunnel_idx) {
         }
         return;
     }
+
+    log_info("Tunnel %u: Forwarding %d bytes agent->client", tunnel->tunnel_id, received);
 
     //log_debug("Received %d bytes from agent on tunnel %u", received, tunnel->tunnel_id);
 
