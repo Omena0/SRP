@@ -67,45 +67,40 @@ void* tunnel_worker(void* arg) {
         
         /* Data from local service -> send to server data socket (ZERO OVERHEAD!) */
         if (FD_ISSET(conn->local_sock, &read_fds)) {
-            int consecutive = 0;
-            while (consecutive < 10 && conn->active) {
-                int received = recv(conn->local_sock, (char*)buffer, sizeof(buffer), 0);
-                
-                if (received < 0) {
-                    int err = socket_errno;
-                    if (!socket_would_block(err)) {
-                        log_error("Local connection error: %d", err);
-                        goto cleanup;
-                    }
-                    break; /* No more data */
-                } else if (received == 0) {
-                    log_info("Local connection closed (tunnel %u)", conn->tunnel_id);
+            int received = recv(conn->local_sock, (char*)buffer, sizeof(buffer), 0);
+            
+            if (received < 0) {
+                int err = socket_errno;
+                if (!socket_would_block(err)) {
+                    log_error("Local connection error: %d", err);
                     goto cleanup;
-                } else {
-                    /* Send raw bytes directly - NO protocol overhead! */
-                    size_t sent = 0;
-                    while (sent < (size_t)received) {
-                        int s = send(conn->data_sock, (const char*)buffer + sent,
-                                   received - sent, MSG_NOSIGNAL);
-                        if (s < 0) {
-                            if (!socket_would_block(socket_errno)) {
-                                log_error("Failed to send to server: %d", socket_errno);
-                                goto cleanup;
-                            }
-                            /* Wait briefly for socket to be writable */
-                            fd_set wfds;
-                            FD_ZERO(&wfds);
-                            FD_SET(conn->data_sock, &wfds);
-                            struct timeval tv = {5, 0};
-                            if (select(conn->data_sock + 1, NULL, &wfds, NULL, &tv) <= 0) {
-                                log_error("Send timeout");
-                                goto cleanup;
-                            }
-                            continue;
+                }
+            } else if (received == 0) {
+                log_info("Local connection closed (tunnel %u)", conn->tunnel_id);
+                goto cleanup;
+            } else {
+                /* Send raw bytes directly - NO protocol overhead! */
+                size_t sent = 0;
+                while (sent < (size_t)received) {
+                    int s = send(conn->data_sock, (const char*)buffer + sent,
+                               received - sent, MSG_NOSIGNAL);
+                    if (s < 0) {
+                        if (!socket_would_block(socket_errno)) {
+                            log_error("Failed to send to server: %d", socket_errno);
+                            goto cleanup;
                         }
-                        sent += s;
+                        /* Wait briefly for socket to be writable */
+                        fd_set wfds;
+                        FD_ZERO(&wfds);
+                        FD_SET(conn->data_sock, &wfds);
+                        struct timeval tv = {5, 0};
+                        if (select(conn->data_sock + 1, NULL, &wfds, NULL, &tv) <= 0) {
+                            log_error("Send timeout");
+                            goto cleanup;
+                        }
+                        continue;
                     }
-                    consecutive++;
+                    sent += s;
                 }
             }
         }
