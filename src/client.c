@@ -318,20 +318,67 @@ static void handle_tunnel_open(agent_state_t* agent, const message_t* msg) {
         return;
     }
 
-    /* Perform blocking connect so we can immediately send the tunnel handshake */
-    if (connect(data_sock, (struct sockaddr*)&data_addr, sizeof(data_addr)) < 0) {
-        log_error("Failed to connect data socket to server: %d", socket_errno);
-        socket_close(local_sock);
-        socket_close(data_sock);
-        /* Inform server to close tunnel */
-        message_t* close_msg = message_create_tunnel_close(tunnel_id);
-        message_send(agent->server_sock, close_msg);
-        message_free(close_msg);
-        return;
+    log_info("Tunnel %u: Connecting data socket to %s:%u", tunnel_id, agent->config.server_host, payload.data_port);
+
+    /* Set non-blocking for connection with timeout */
+    socket_set_nonblocking(data_sock);
+
+    /* Attempt connection */
+    int conn_result = connect(data_sock, (struct sockaddr*)&data_addr, sizeof(data_addr));
+    if (conn_result < 0) {
+        int err = socket_errno;
+        if (!socket_would_block(err) && err != IN_PROGRESS) {
+            log_error("Failed to connect data socket to server: %d", err);
+            socket_close(local_sock);
+            socket_close(data_sock);
+            /* Inform server to close tunnel */
+            message_t* close_msg = message_create_tunnel_close(tunnel_id);
+            message_send(agent->server_sock, close_msg);
+            message_free(close_msg);
+            return;
+        }
+
+        /* Connection in progress, wait for it with select */
+        fd_set write_fds;
+        FD_ZERO(&write_fds);
+        FD_SET(data_sock, &write_fds);
+        struct timeval timeout = {10, 0}; /* 10 second timeout */
+        int sel = select(data_sock + 1, NULL, &write_fds, NULL, &timeout);
+
+        if (sel <= 0) {
+            log_error("Data socket connection timeout or error (tunnel %u)", tunnel_id);
+            socket_close(local_sock);
+            socket_close(data_sock);
+            message_t* close_msg = message_create_tunnel_close(tunnel_id);
+            message_send(agent->server_sock, close_msg);
+            message_free(close_msg);
+            return;
+        }
+
+        /* Check if connection succeeded */
+        int so_error = 0;
+        socklen_t len = sizeof(so_error);
+        getsockopt(data_sock, SOL_SOCKET, SO_ERROR, (char*)&so_error, &len);
+        if (so_error != 0) {
+            log_error("Data socket connection failed: %d (tunnel %u)", so_error, tunnel_id);
+            socket_close(local_sock);
+            socket_close(data_sock);
+            message_t* close_msg = message_create_tunnel_close(tunnel_id);
+            message_send(agent->server_sock, close_msg);
+            message_free(close_msg);
+            return;
+        }
     }
+
+    log_info("Tunnel %u: Data socket connected", tunnel_id);
+
+    log_info("Tunnel %u: Data socket connected", tunnel_id);
 
     /* Send 4-byte tunnel id handshake (network byte order) */
     uint32_t net_tid = htonl(tunnel_id);
+    
+    /* Socket is non-blocking, but we need to send the handshake immediately */
+    socket_set_blocking(data_sock);
     
     int total_sent = 0;
     while (total_sent < (int)sizeof(net_tid)) {
