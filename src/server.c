@@ -207,6 +207,24 @@ static void* tunnel_worker(void* arg) {
             tunnel->active = 0;
             goto cleanup;
         }
+        
+        /* Check if client socket is still alive */
+        fd_set check_fds;
+        FD_ZERO(&check_fds);
+        FD_SET(tunnel->client_sock, &check_fds);
+        struct timeval check_timeout = {0, 0};
+        int check_ready = select(tunnel->client_sock + 1, &check_fds, NULL, NULL, &check_timeout);
+        if (check_ready > 0) {
+            /* Data available or socket closed - check by reading */
+            char check_byte;
+            int peek_result = recv(tunnel->client_sock, &check_byte, 1, MSG_PEEK);
+            if (peek_result <= 0) {
+                log_info("Tunnel %u: Client disconnected while waiting for agent data socket", tunnel->tunnel_id);
+                tunnel->active = 0;
+                goto cleanup;
+            }
+        }
+        
 #ifdef _WIN32
         Sleep(100);
 #else
@@ -879,8 +897,8 @@ static void handle_forward_port_connection(server_state_t* srv, int fp_idx) {
     socket_set_nonblocking(client_sock);
     socket_set_nodelay(client_sock);
 
-    /* Set large buffers for maximum throughput */
-    int bufsize = 4 * 1024 * 1024; /* 4MB for chunksending heavy loads */
+    /* Set reasonable buffers for throughput without excessive memory */
+    int bufsize = 256 * 1024; /* 256KB - plenty for Minecraft while being memory efficient */
     setsockopt(client_sock, SOL_SOCKET, SO_RCVBUF, (const char*)&bufsize, sizeof(bufsize));
     setsockopt(client_sock, SOL_SOCKET, SO_SNDBUF, (const char*)&bufsize, sizeof(bufsize));
 
@@ -1381,8 +1399,8 @@ int server_run(const char* config_path) {
                     socket_set_nonblocking(data_sock);
                     socket_set_nodelay(data_sock);
 
-                    /* Set large buffers for data path */
-                    int bufsize = 4 * 1024 * 1024; /* 4MB to match client buffers */
+                    /* Set reasonable buffers for data path */
+                    int bufsize = 256 * 1024; /* 256KB - plenty for Minecraft while being memory efficient */
                     setsockopt(data_sock, SOL_SOCKET, SO_RCVBUF, (const char*)&bufsize, sizeof(bufsize));
                     setsockopt(data_sock, SOL_SOCKET, SO_SNDBUF, (const char*)&bufsize, sizeof(bufsize));
 

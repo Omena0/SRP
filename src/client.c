@@ -67,8 +67,8 @@ static socket_t connect_to_server(const agent_config_t* config) {
     setsockopt(sock, IPPROTO_TCP, TCP_QUICKACK, &quickack, sizeof(quickack));
 #endif
     
-    /* Set large buffers */
-    int bufsize = 4 * 1024 * 1024; /* 4MB for chunksending heavy loads */
+    /* Set reasonable buffers */
+    int bufsize = 256 * 1024; /* 256KB - plenty for control messages */
     setsockopt(sock, SOL_SOCKET, SO_RCVBUF, (const char*)&bufsize, sizeof(bufsize));
     setsockopt(sock, SOL_SOCKET, SO_SNDBUF, (const char*)&bufsize, sizeof(bufsize));
     
@@ -265,8 +265,8 @@ static void handle_tunnel_open(agent_state_t* agent, const message_t* msg) {
     socket_set_nodelay(local_sock);
     socket_set_nonblocking(local_sock);
     
-    /* Increase socket buffers for better throughput */
-    int bufsize = 2 * 1024 * 1024; /* 2MB for chunksending heavy loads */
+    /* Set reasonable socket buffers */
+    int bufsize = 256 * 1024; /* 256KB - plenty for Minecraft */
     setsockopt(local_sock, SOL_SOCKET, SO_RCVBUF, (const char*)&bufsize, sizeof(bufsize));
     setsockopt(local_sock, SOL_SOCKET, SO_SNDBUF, (const char*)&bufsize, sizeof(bufsize));
     
@@ -382,8 +382,8 @@ static void handle_tunnel_open(agent_state_t* agent, const message_t* msg) {
 
     socket_set_nodelay(data_sock);
 
-    /* Set larger buffers for data path */
-    int dbuf = 2 * 1024 * 1024;
+    /* Set reasonable buffers for data path */
+    int dbuf = 256 * 1024; /* 256KB - plenty for Minecraft */
     setsockopt(data_sock, SOL_SOCKET, SO_RCVBUF, (const char*)&dbuf, sizeof(dbuf));
     setsockopt(data_sock, SOL_SOCKET, SO_SNDBUF, (const char*)&dbuf, sizeof(dbuf));
 
