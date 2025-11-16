@@ -47,7 +47,6 @@ typedef struct {
     size_t read_pos;
 } buffer_t;
 
-buffer_t* buffer_create(size_t initial_capacity);
 void buffer_free(buffer_t* buf);
 int buffer_write(buffer_t* buf, const uint8_t* data, size_t len);
 int buffer_read(buffer_t* buf, uint8_t* data, size_t len);

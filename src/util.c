@@ -301,15 +301,6 @@ char* file_read_all(const char* path, size_t* size) {
 
 /* ========== Buffer Utilities ========== */
 
-buffer_t* buffer_create(size_t initial_capacity) {
-    buffer_t* buf = (buffer_t*)xmalloc(sizeof(buffer_t));
-    buf->capacity = initial_capacity > 0 ? initial_capacity : 4096;
-    buf->data = (uint8_t*)xmalloc(buf->capacity);
-    buf->size = 0;
-    buf->read_pos = 0;
-    return buf;
-}
-
 void buffer_free(buffer_t* buf) {
     if (!buf) return;
     xfree(buf->data);
