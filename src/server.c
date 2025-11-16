@@ -1215,6 +1215,8 @@ int server_run(const char* config_path) {
 
     log_info("Entering main event loop, srv.running=%d", srv.running);
 
+    uint64_t last_keepalive_check = get_timestamp();
+
     /* Main event loop */
     while (srv.running) {
         fd_set read_fds, write_fds;
@@ -1419,8 +1421,14 @@ int server_run(const char* config_path) {
 
         /* Tunnels are now handled by dedicated worker threads, no select() handling needed */
 
-        /* Periodic login store reload */
+        /* Periodic operations - only check every 5 seconds to reduce CPU */
         uint64_t now = get_timestamp();
+        if (now - last_keepalive_check < 5) {
+            continue; /* Skip expensive checks if less than 5 seconds passed */
+        }
+        last_keepalive_check = now;
+
+        /* Periodic login store reload */
         if (now - srv.last_reload > RELOAD_INTERVAL_SECS) {
             login_store_reload_if_modified(srv.login_store);
             srv.last_reload = now;
