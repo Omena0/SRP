@@ -1249,7 +1249,7 @@ int server_run(const char* config_path) {
 
         /* Tunnel sockets are now handled by dedicated worker threads */
 
-        struct timeval timeout = {0, 10000}; /* 10ms - responsive but low CPU */
+        struct timeval timeout = {0, 100000}; /* 100ms - responsive but low CPU */
 
         int ready = select(max_fd + 1, &read_fds, &write_fds, NULL, &timeout);
 
