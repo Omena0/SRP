@@ -197,7 +197,7 @@ static void* tunnel_worker(void* arg) {
     tunnel_t* tunnel = (tunnel_t*)arg;
     uint8_t buffer_client[BUFFER_SIZE];  /* Client->Agent buffer */
     uint8_t buffer_agent[BUFFER_SIZE];   /* Agent->Client buffer */
-    fd_set read_fds;
+    fd_set read_fds, write_fds;
     struct timeval timeout;
     
     log_info("Tunnel %u worker thread started", tunnel->tunnel_id);
@@ -241,15 +241,26 @@ static void* tunnel_worker(void* arg) {
     
     while (tunnel->active) {
         FD_ZERO(&read_fds);
+        FD_ZERO(&write_fds);
+        
+        /* Always monitor reads */
         FD_SET(tunnel->client_sock, &read_fds);
         FD_SET(tunnel->agent_data_sock, &read_fds);
+        
+        /* Monitor writes only if we have buffered data */
+        if (tunnel->to_agent_buffer_size > 0) {
+            FD_SET(tunnel->agent_data_sock, &write_fds);
+        }
+        if (tunnel->to_client_buffer_size > 0) {
+            FD_SET(tunnel->client_sock, &write_fds);
+        }
         
         timeout.tv_sec = 0;
         timeout.tv_usec = 1000; /* 1ms - low latency for data forwarding */
         
         socket_t max_fd = tunnel->client_sock > tunnel->agent_data_sock ? 
                          tunnel->client_sock : tunnel->agent_data_sock;
-        int ready = select(max_fd + 1, &read_fds, NULL, NULL, &timeout);
+        int ready = select(max_fd + 1, &read_fds, &write_fds, NULL, &timeout);
         
         if (ready < 0) {
             log_error("Tunnel %u: select() failed: %d", tunnel->tunnel_id, socket_errno);
@@ -257,6 +268,36 @@ static void* tunnel_worker(void* arg) {
         }
         
         if (ready == 0) continue;
+        
+        /* Flush buffered data to agent if socket is writable */
+        if (FD_ISSET(tunnel->agent_data_sock, &write_fds) && tunnel->to_agent_buffer_size > 0) {
+            int sent = send(tunnel->agent_data_sock, (const char*)tunnel->to_agent_buffer,
+                          tunnel->to_agent_buffer_size, MSG_NOSIGNAL);
+            if (sent > 0) {
+                memmove(tunnel->to_agent_buffer, tunnel->to_agent_buffer + sent,
+                       tunnel->to_agent_buffer_size - sent);
+                tunnel->to_agent_buffer_size -= sent;
+            } else if (sent < 0 && !socket_would_block(socket_errno)) {
+                log_error("Tunnel %u: Failed to flush buffer to agent: %d",
+                        tunnel->tunnel_id, socket_errno);
+                goto cleanup;
+            }
+        }
+        
+        /* Flush buffered data to client if socket is writable */
+        if (FD_ISSET(tunnel->client_sock, &write_fds) && tunnel->to_client_buffer_size > 0) {
+            int sent = send(tunnel->client_sock, (const char*)tunnel->to_client_buffer,
+                          tunnel->to_client_buffer_size, MSG_NOSIGNAL);
+            if (sent > 0) {
+                memmove(tunnel->to_client_buffer, tunnel->to_client_buffer + sent,
+                       tunnel->to_client_buffer_size - sent);
+                tunnel->to_client_buffer_size -= sent;
+            } else if (sent < 0 && !socket_would_block(socket_errno)) {
+                log_error("Tunnel %u: Failed to flush buffer to client: %d",
+                        tunnel->tunnel_id, socket_errno);
+                goto cleanup;
+            }
+        }
         
         /* Forward client -> agent */
         if (FD_ISSET(tunnel->client_sock, &read_fds)) {
@@ -267,30 +308,39 @@ static void* tunnel_worker(void* arg) {
                     break;
                 }
             } else {
-                /* Send all data to agent */
-                size_t sent = 0;
-                while (sent < (size_t)received) {
-                    int s = send(tunnel->agent_data_sock, (const char*)buffer_client + sent,
-                               received - sent, MSG_NOSIGNAL);
-                    if (s < 0) {
-                        if (!socket_would_block(socket_errno)) {
-                            log_error("Tunnel %u: Failed to send to agent: %d", 
-                                    tunnel->tunnel_id, socket_errno);
-                            goto cleanup;
-                        }
-                        /* Wait for socket to be writable */
-                        fd_set wfds;
-                        FD_ZERO(&wfds);
-                        FD_SET(tunnel->agent_data_sock, &wfds);
-                        struct timeval tv = {0, 100000}; /* 100ms timeout */
-                        if (select(tunnel->agent_data_sock + 1, NULL, &wfds, NULL, &tv) <= 0) {
-                            log_error("Tunnel %u: Send timeout", tunnel->tunnel_id);
-                            goto cleanup;
-                        }
+                /* Try direct send first if no buffered data */
+                if (tunnel->to_agent_buffer_size == 0) {
+                    int sent = send(tunnel->agent_data_sock, (const char*)buffer_client,
+                                  received, MSG_NOSIGNAL);
+                    if (sent == received) {
+                        /* All sent directly */
                         continue;
+                    } else if (sent > 0) {
+                        /* Partial send - buffer the rest */
+                        received -= sent;
+                        memmove(buffer_client, buffer_client + sent, received);
+                    } else if (!socket_would_block(socket_errno)) {
+                        log_error("Tunnel %u: Failed to send to agent: %d",
+                                tunnel->tunnel_id, socket_errno);
+                        goto cleanup;
                     }
-                    sent += s;
+                    /* Would block or partial - fall through to buffer */
                 }
+                
+                /* Buffer data for later */
+                if (tunnel->to_agent_buffer_capacity == 0) {
+                    tunnel->to_agent_buffer_capacity = 524288; /* 512KB */
+                    tunnel->to_agent_buffer = (uint8_t*)xmalloc(tunnel->to_agent_buffer_capacity);
+                }
+                
+                if (tunnel->to_agent_buffer_size + received > tunnel->to_agent_buffer_capacity) {
+                    log_error("Tunnel %u: Agent buffer full, dropping connection", tunnel->tunnel_id);
+                    goto cleanup;
+                }
+                
+                memcpy(tunnel->to_agent_buffer + tunnel->to_agent_buffer_size,
+                      buffer_client, received);
+                tunnel->to_agent_buffer_size += received;
             }
         }
         
@@ -303,30 +353,39 @@ static void* tunnel_worker(void* arg) {
                     break;
                 }
             } else {
-                /* Send all data to client */
-                size_t sent = 0;
-                while (sent < (size_t)received) {
-                    int s = send(tunnel->client_sock, (const char*)buffer_agent + sent,
-                               received - sent, MSG_NOSIGNAL);
-                    if (s < 0) {
-                        if (!socket_would_block(socket_errno)) {
-                            log_error("Tunnel %u: Failed to send to client: %d", 
-                                    tunnel->tunnel_id, socket_errno);
-                            goto cleanup;
-                        }
-                        /* Wait for socket to be writable */
-                        fd_set wfds;
-                        FD_ZERO(&wfds);
-                        FD_SET(tunnel->client_sock, &wfds);
-                        struct timeval tv = {0, 100000}; /* 100ms timeout */
-                        if (select(tunnel->client_sock + 1, NULL, &wfds, NULL, &tv) <= 0) {
-                            log_error("Tunnel %u: Send timeout", tunnel->tunnel_id);
-                            goto cleanup;
-                        }
+                /* Try direct send first if no buffered data */
+                if (tunnel->to_client_buffer_size == 0) {
+                    int sent = send(tunnel->client_sock, (const char*)buffer_agent,
+                                  received, MSG_NOSIGNAL);
+                    if (sent == received) {
+                        /* All sent directly */
                         continue;
+                    } else if (sent > 0) {
+                        /* Partial send - buffer the rest */
+                        received -= sent;
+                        memmove(buffer_agent, buffer_agent + sent, received);
+                    } else if (!socket_would_block(socket_errno)) {
+                        log_error("Tunnel %u: Failed to send to client: %d",
+                                tunnel->tunnel_id, socket_errno);
+                        goto cleanup;
                     }
-                    sent += s;
+                    /* Would block or partial - fall through to buffer */
                 }
+                
+                /* Buffer data for later */
+                if (tunnel->to_client_buffer_capacity == 0) {
+                    tunnel->to_client_buffer_capacity = 524288; /* 512KB */
+                    tunnel->to_client_buffer = (uint8_t*)xmalloc(tunnel->to_client_buffer_capacity);
+                }
+                
+                if (tunnel->to_client_buffer_size + received > tunnel->to_client_buffer_capacity) {
+                    log_error("Tunnel %u: Client buffer full, dropping connection", tunnel->tunnel_id);
+                    goto cleanup;
+                }
+                
+                memcpy(tunnel->to_client_buffer + tunnel->to_client_buffer_size,
+                      buffer_agent, received);
+                tunnel->to_client_buffer_size += received;
             }
         }
     }
