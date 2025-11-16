@@ -21,7 +21,7 @@
 #define BUFFER_SIZE 65536  /* 64KB for high throughput */
 #define RELOAD_INTERVAL_SECS 5
 #define KEEPALIVE_INTERVAL_SECS 30  /* Send PING every 30s */
-#define KEEPALIVE_TIMEOUT_SECS 60   /* Close if no PONG after 60s */
+#define KEEPALIVE_TIMEOUT_SECS 300  /* Close if no PONG after 5 minutes */
 
 /* Tunnel: maps external client connection to agent via dedicated data socket */
 typedef struct {
