@@ -4,36 +4,20 @@
 ## Features
 
 - Authentication with rate limit
-- Fast (under 1ms, can handle 50MB/s or 1000pps easily)
-- Probably has like 20 memory leaks and rce exploits
+- Fast, minimal latency.
+- Efficient. 3kb memory usage with 1 connection.
 - Username & password auth
 - Cross platform
 - Per-user allocation limit
-- Tests
 
 ## Usage
 
 ```sh
 ./srp register <username> <password>
-```
-
-```sh
 ./srp deletelogin <username> <password>
-```
-
-```sh
 ./srp claim <port>
-```
-
-```sh
 ./srp unclaim <username> <password>
-```
-
-```sh
 ./srp forward
-```
-
-```sh
 ./srp serve
 ```
 
