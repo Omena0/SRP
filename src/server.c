@@ -311,6 +311,26 @@ static void* tunnel_worker(void* arg) {
     }
     
 cleanup:
+    log_info("Tunnel %u worker thread cleaning up", tunnel->tunnel_id);
+    
+    /* Close sockets */
+    socket_close(tunnel->client_sock);
+    tunnel->client_sock = INVALID_SOCKET_VALUE;
+    if (tunnel->agent_data_sock != INVALID_SOCKET_VALUE) {
+        socket_close(tunnel->agent_data_sock);
+        tunnel->agent_data_sock = INVALID_SOCKET_VALUE;
+    }
+    
+    /* Free buffers if allocated */
+    if (tunnel->to_agent_buffer) {
+        xfree(tunnel->to_agent_buffer);
+        tunnel->to_agent_buffer = NULL;
+    }
+    if (tunnel->to_client_buffer) {
+        xfree(tunnel->to_client_buffer);
+        tunnel->to_client_buffer = NULL;
+    }
+    
     tunnel->active = 0;
     log_info("Tunnel %u worker thread finished", tunnel->tunnel_id);
     
@@ -350,12 +370,15 @@ static void close_tunnel(server_state_t* srv, int idx) {
         message_free(msg);
     }
 
-    socket_close(tunnel->client_sock);
+    /* Thread may have already closed sockets and freed buffers, check before cleanup */
+    if (tunnel->client_sock != INVALID_SOCKET_VALUE) {
+        socket_close(tunnel->client_sock);
+    }
     if (tunnel->agent_data_sock != INVALID_SOCKET_VALUE) {
         socket_close(tunnel->agent_data_sock);
     }
 
-    /* Free write buffers */
+    /* Free write buffers if still allocated */
     if (tunnel->to_agent_buffer) {
         xfree(tunnel->to_agent_buffer);
         tunnel->to_agent_buffer = NULL;
@@ -371,6 +394,7 @@ static void close_tunnel(server_state_t* srv, int idx) {
 
     tunnel->tunnel_id = 0;
     tunnel->agent_data_sock = INVALID_SOCKET_VALUE;
+    tunnel->client_sock = INVALID_SOCKET_VALUE;
     tunnel->active = 0;
 }
 
