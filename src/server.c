@@ -31,6 +31,7 @@ typedef struct {
     uint16_t port;
     int agent_idx;       /* Index in clients array */
     uint8_t active;
+    thread_t thread;     /* Dedicated thread for this tunnel */
     /* Write buffers for both directions */
     uint8_t* to_agent_buffer;
     size_t to_agent_buffer_size;
@@ -188,10 +189,159 @@ static void close_client(server_state_t* srv, int idx) {
     client->authenticated = 0;
 }
 
+/* Tunnel worker thread - handles bidirectional forwarding for one tunnel */
+static void* tunnel_worker(void* arg) {
+    tunnel_t* tunnel = (tunnel_t*)arg;
+    uint8_t buffer_client[BUFFER_SIZE];  /* Client->Agent buffer */
+    uint8_t buffer_agent[BUFFER_SIZE];   /* Agent->Client buffer */
+    fd_set read_fds;
+    struct timeval timeout;
+    
+    log_info("Tunnel %u worker thread started", tunnel->tunnel_id);
+    
+    /* Wait for agent data socket to be connected */
+    int wait_count = 0;
+    while (tunnel->active && tunnel->agent_data_sock == INVALID_SOCKET_VALUE) {
+        if (++wait_count > 100) { /* 10 second timeout */
+            log_error("Tunnel %u: Agent data socket not connected after 10s", tunnel->tunnel_id);
+            tunnel->active = 0;
+            goto cleanup;
+        }
+#ifdef _WIN32
+        Sleep(100);
+#else
+        usleep(100000);
+#endif
+    }
+    
+    if (!tunnel->active) goto cleanup;
+    
+    log_debug("Tunnel %u: Starting bidirectional forwarding", tunnel->tunnel_id);
+    
+    while (tunnel->active) {
+        FD_ZERO(&read_fds);
+        FD_SET(tunnel->client_sock, &read_fds);
+        FD_SET(tunnel->agent_data_sock, &read_fds);
+        
+        timeout.tv_sec = 1;
+        timeout.tv_usec = 0;
+        
+        socket_t max_fd = tunnel->client_sock > tunnel->agent_data_sock ? 
+                         tunnel->client_sock : tunnel->agent_data_sock;
+        int ready = select(max_fd + 1, &read_fds, NULL, NULL, &timeout);
+        
+        if (ready < 0) {
+            log_error("Tunnel %u: select() failed: %d", tunnel->tunnel_id, socket_errno);
+            break;
+        }
+        
+        if (ready == 0) continue;
+        
+        /* Forward client -> agent */
+        if (FD_ISSET(tunnel->client_sock, &read_fds)) {
+            int received = recv(tunnel->client_sock, (char*)buffer_client, sizeof(buffer_client), 0);
+            if (received <= 0) {
+                if (received == 0 || !socket_would_block(socket_errno)) {
+                    log_info("Tunnel %u: Client disconnected", tunnel->tunnel_id);
+                    break;
+                }
+            } else {
+                /* Send all data to agent */
+                size_t sent = 0;
+                while (sent < (size_t)received) {
+                    int s = send(tunnel->agent_data_sock, (const char*)buffer_client + sent,
+                               received - sent, MSG_NOSIGNAL);
+                    if (s < 0) {
+                        if (!socket_would_block(socket_errno)) {
+                            log_error("Tunnel %u: Failed to send to agent: %d", 
+                                    tunnel->tunnel_id, socket_errno);
+                            goto cleanup;
+                        }
+                        /* Wait for socket to be writable */
+                        fd_set wfds;
+                        FD_ZERO(&wfds);
+                        FD_SET(tunnel->agent_data_sock, &wfds);
+                        struct timeval tv = {5, 0};
+                        if (select(tunnel->agent_data_sock + 1, NULL, &wfds, NULL, &tv) <= 0) {
+                            log_error("Tunnel %u: Send timeout", tunnel->tunnel_id);
+                            goto cleanup;
+                        }
+                        continue;
+                    }
+                    sent += s;
+                }
+            }
+        }
+        
+        /* Forward agent -> client */
+        if (FD_ISSET(tunnel->agent_data_sock, &read_fds)) {
+            int received = recv(tunnel->agent_data_sock, (char*)buffer_agent, sizeof(buffer_agent), 0);
+            if (received <= 0) {
+                if (received == 0 || !socket_would_block(socket_errno)) {
+                    log_info("Tunnel %u: Agent disconnected", tunnel->tunnel_id);
+                    break;
+                }
+            } else {
+                /* Send all data to client */
+                size_t sent = 0;
+                while (sent < (size_t)received) {
+                    int s = send(tunnel->client_sock, (const char*)buffer_agent + sent,
+                               received - sent, MSG_NOSIGNAL);
+                    if (s < 0) {
+                        if (!socket_would_block(socket_errno)) {
+                            log_error("Tunnel %u: Failed to send to client: %d", 
+                                    tunnel->tunnel_id, socket_errno);
+                            goto cleanup;
+                        }
+                        /* Wait for socket to be writable */
+                        fd_set wfds;
+                        FD_ZERO(&wfds);
+                        FD_SET(tunnel->client_sock, &wfds);
+                        struct timeval tv = {5, 0};
+                        if (select(tunnel->client_sock + 1, NULL, &wfds, NULL, &tv) <= 0) {
+                            log_error("Tunnel %u: Send timeout", tunnel->tunnel_id);
+                            goto cleanup;
+                        }
+                        continue;
+                    }
+                    sent += s;
+                }
+            }
+        }
+    }
+    
+cleanup:
+    tunnel->active = 0;
+    log_info("Tunnel %u worker thread finished", tunnel->tunnel_id);
+    
+#ifdef _WIN32
+    return 0;
+#else
+    return NULL;
+#endif
+}
+
 /* Close tunnel */
 static void close_tunnel(server_state_t* srv, int idx) {
     tunnel_t* tunnel = &srv->tunnels[idx];
     if (!tunnel->active) return;
+
+    /* Mark inactive to signal thread to stop */
+    tunnel->active = 0;
+    
+    /* Wait for thread to finish if it was started */
+#ifdef _WIN32
+    if (tunnel->thread) {
+        WaitForSingleObject(tunnel->thread, 5000);  /* 5 second timeout */
+        CloseHandle(tunnel->thread);
+        tunnel->thread = NULL;
+    }
+#else
+    if (tunnel->thread) {
+        pthread_join(tunnel->thread, NULL);
+        tunnel->thread = 0;
+    }
+#endif
 
     /* Notify agent of tunnel close via control socket */
     if (srv->clients[tunnel->agent_idx].active) {
@@ -757,16 +907,37 @@ static void handle_forward_port_connection(server_state_t* srv, int fp_idx) {
     tunnel->to_client_buffer_size = 0;
     tunnel->to_client_buffer_capacity = 0;
     tunnel->active = 1;
+    tunnel->thread = 0;
 
     /* Notify agent to connect back on data port for this tunnel */
     message_t* msg = message_create_tunnel_open(tunnel->tunnel_id, fp->port, srv->config.data_port);
     if (message_send(srv->clients[agent_idx].sock, msg) != 0) {
         log_error("Failed to send TUNNEL_OPEN to agent");
         close_tunnel(srv, tunnel_idx);
+        message_free(msg);
+        return;
     }
     message_free(msg);
 
     log_info("Created tunnel %u for port %u, waiting for agent data connection", tunnel->tunnel_id, fp->port);
+    
+    /* Spawn worker thread for this tunnel */
+#ifdef _WIN32
+    tunnel->thread = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)tunnel_worker, tunnel, 0, NULL);
+    if (!tunnel->thread) {
+        log_error("Failed to create worker thread for tunnel %u", tunnel->tunnel_id);
+        close_tunnel(srv, tunnel_idx);
+        return;
+    }
+#else
+    if (pthread_create(&tunnel->thread, NULL, tunnel_worker, tunnel) != 0) {
+        log_error("Failed to create worker thread for tunnel %u", tunnel->tunnel_id);
+        close_tunnel(srv, tunnel_idx);
+        return;
+    }
+#endif
+    
+    log_debug("Tunnel %u worker thread spawned", tunnel->tunnel_id);
 }
 
 /* Handle data from external client - forward raw bytes to agent via data socket */
@@ -1076,26 +1247,7 @@ int server_run(const char* config_path) {
             }
         }
 
-        /* Add tunnel sockets */
-        for (int i = 0; i < MAX_TUNNELS; i++) {
-            if (srv.tunnels[i].active) {
-                FD_SET(srv.tunnels[i].client_sock, &read_fds);
-                /* Monitor for writeability if we have buffered data */
-                if (srv.tunnels[i].to_client_buffer_size > 0) {
-                    FD_SET(srv.tunnels[i].client_sock, &write_fds);
-                }
-                if (srv.tunnels[i].client_sock > max_fd) max_fd = srv.tunnels[i].client_sock;
-
-                /* Monitor agent data socket if connected */
-                if (srv.tunnels[i].agent_data_sock != INVALID_SOCKET_VALUE) {
-                    FD_SET(srv.tunnels[i].agent_data_sock, &read_fds);
-                    if (srv.tunnels[i].to_agent_buffer_size > 0) {
-                        FD_SET(srv.tunnels[i].agent_data_sock, &write_fds);
-                    }
-                    if (srv.tunnels[i].agent_data_sock > max_fd) max_fd = srv.tunnels[i].agent_data_sock;
-                }
-            }
-        }
+        /* Tunnel sockets are now handled by dedicated worker threads */
 
         struct timeval timeout = {0, 1000}; /* 1ms for low latency */
 
@@ -1265,80 +1417,7 @@ int server_run(const char* config_path) {
             }
         }
 
-        /* Handle tunnel data */
-        for (int i = 0; i < MAX_TUNNELS; i++) {
-            if (!srv.tunnels[i].active) continue;
-
-            /* Flush write buffer if socket is writable */
-            if (FD_ISSET(srv.tunnels[i].client_sock, &write_fds)) {
-                if (srv.tunnels[i].to_client_buffer_size > 0) {
-                    /* Try to flush as much as possible */
-                    while (srv.tunnels[i].to_client_buffer_size > 0) {
-                        int sent = send(srv.tunnels[i].client_sock,
-                                      (const char*)srv.tunnels[i].to_client_buffer,
-                                      srv.tunnels[i].to_client_buffer_size, MSG_NOSIGNAL);
-                        if (sent > 0) {
-                            memmove(srv.tunnels[i].to_client_buffer,
-                                   srv.tunnels[i].to_client_buffer + sent,
-                                   srv.tunnels[i].to_client_buffer_size - sent);
-                            srv.tunnels[i].to_client_buffer_size -= sent;
-                        } else if (sent < 0) {
-                            int err = socket_errno;
-                            if (socket_would_block(err)) {
-                                break; /* Socket full, try again later */
-                            } else {
-                                log_error("Failed to write to client: %d", err);
-                                close_tunnel(&srv, i);
-                                break;
-                            }
-                        } else {
-                            break;
-                        }
-                    }
-                }
-            }
-
-            /* Read data from client */
-            if (FD_ISSET(srv.tunnels[i].client_sock, &read_fds)) {
-                handle_tunnel_data(&srv, i);
-            }
-
-            /* Flush to_agent_buffer if agent data socket is writable */
-            if (srv.tunnels[i].agent_data_sock != INVALID_SOCKET_VALUE &&
-                FD_ISSET(srv.tunnels[i].agent_data_sock, &write_fds)) {
-                if (srv.tunnels[i].to_agent_buffer_size > 0) {
-                    /* Try to flush as much as possible */
-                    while (srv.tunnels[i].to_agent_buffer_size > 0) {
-                        int sent = send(srv.tunnels[i].agent_data_sock,
-                                      (const char*)srv.tunnels[i].to_agent_buffer,
-                                      srv.tunnels[i].to_agent_buffer_size, MSG_NOSIGNAL);
-                        if (sent > 0) {
-                            memmove(srv.tunnels[i].to_agent_buffer,
-                                   srv.tunnels[i].to_agent_buffer + sent,
-                                   srv.tunnels[i].to_agent_buffer_size - sent);
-                            srv.tunnels[i].to_agent_buffer_size -= sent;
-                        } else if (sent < 0) {
-                            int err = socket_errno;
-                            if (socket_would_block(err)) {
-                                break; /* Socket full, try again later */
-                            } else {
-                                log_error("Failed to write to agent data socket: %d", err);
-                                close_tunnel(&srv, i);
-                                break;
-                            }
-                        } else {
-                            break;
-                        }
-                    }
-                }
-            }
-
-            /* Read data from agent data socket */
-            if (srv.tunnels[i].agent_data_sock != INVALID_SOCKET_VALUE &&
-                FD_ISSET(srv.tunnels[i].agent_data_sock, &read_fds)) {
-                handle_agent_tunnel_data(&srv, i);
-            }
-        }
+        /* Tunnels are now handled by dedicated worker threads, no select() handling needed */
 
         /* Periodic login store reload */
         uint64_t now = get_timestamp();
