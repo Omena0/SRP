@@ -702,7 +702,7 @@ int client_run(const char* config_path) {
         FD_ZERO(&read_fds);
         FD_SET(agent.server_sock, &read_fds);
         
-        struct timeval timeout = {0, 500}; /* 0.5ms - ultra-low latency for heavy loads */
+        struct timeval timeout = {0, 100000}; /* 100ms - responsive but low CPU */
         int ready = select(agent.server_sock + 1, &read_fds, NULL, NULL, &timeout);
         
         if (ready > 0) {

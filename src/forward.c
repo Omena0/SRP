@@ -33,7 +33,7 @@ void* tunnel_worker(void* arg) {
         mutex_unlock(&conn->write_mutex);
         
         timeout.tv_sec = 0;
-        timeout.tv_usec = 1000; /* 1ms - low latency without excessive CPU */
+        timeout.tv_usec = 100000; /* 100ms - responsive but low CPU */
         
         socket_t max_fd = conn->local_sock > conn->data_sock ? conn->local_sock : conn->data_sock;
         int ready = select(max_fd + 1, &read_fds, &write_fds, NULL, &timeout);
