@@ -370,19 +370,9 @@ static void close_tunnel(server_state_t* srv, int idx) {
     /* Mark inactive to signal thread to stop */
     tunnel->active = 0;
     
-    /* Wait for thread to finish if it was started */
-#ifdef _WIN32
-    if (tunnel->thread) {
-        WaitForSingleObject(tunnel->thread, 5000);  /* 5 second timeout */
-        CloseHandle(tunnel->thread);
-        tunnel->thread = NULL;
-    }
-#else
-    if (tunnel->thread) {
-        pthread_join(tunnel->thread, NULL);
-        tunnel->thread = 0;
-    }
-#endif
+    /* Thread is detached, so no need to join - resources freed automatically */
+    /* Just give it a moment to exit gracefully */
+    platform_sleep_ms(10);
 
     /* Notify agent of tunnel close via control socket */
     if (srv->clients[tunnel->agent_idx].active) {
@@ -991,7 +981,11 @@ static void handle_forward_port_connection(server_state_t* srv, int fp_idx) {
         return;
     }
     
-    log_debug("Tunnel %u worker thread spawned", tunnel->tunnel_id);
+    /* Detach thread so resources are freed automatically when it exits */
+    thread_detach(tunnel->thread);
+    tunnel->thread = 0; /* Mark as detached */
+    
+    log_debug("Tunnel %u worker thread spawned (detached)", tunnel->tunnel_id);
 }
 
 /* Handle data from external client - forward raw bytes to agent via data socket */

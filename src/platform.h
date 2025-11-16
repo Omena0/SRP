@@ -69,6 +69,12 @@
         return 0;
     }
 
+    static inline int thread_join_timeout(thread_t thread, int timeout_ms) {
+        DWORD result = WaitForSingleObject(thread, timeout_ms);
+        CloseHandle(thread);
+        return (result == WAIT_TIMEOUT) ? -1 : 0;
+    }
+
     static inline int thread_detach(thread_t thread) {
         CloseHandle(thread);
         return 0;
@@ -182,6 +188,12 @@
     }
 
     static inline int thread_join(thread_t thread) {
+        return pthread_join(thread, NULL);
+    }
+
+    static inline int thread_join_timeout(thread_t thread, int timeout_ms) {
+        /* POSIX doesn't have timed join, use regular join */
+        (void)timeout_ms;
         return pthread_join(thread, NULL);
     }
 
