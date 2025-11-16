@@ -13,7 +13,6 @@
 #else
     #include <sys/select.h>
     #include <signal.h>
-    #include <malloc.h>  /* For mallopt */
 #endif
 
 #define MAX_CLIENTS 1024
@@ -1175,13 +1174,6 @@ int server_run(const char* config_path) {
     server_state_t srv;
     memset(&srv, 0, sizeof(srv));
     g_server = &srv;
-
-#ifndef _WIN32
-    /* Limit glibc malloc arena to reduce virtual memory overhead */
-    /* This prevents the ~131MB arena allocation on first pthread_create */
-    mallopt(M_ARENA_MAX, 2);  /* Max 2 arenas instead of 8*cores */
-    mallopt(M_MMAP_THRESHOLD, 128*1024);  /* Use mmap for allocations >128KB */
-#endif
 
     /* Load configuration */
     if (config_load_server(config_path, &srv.config) != 0) {

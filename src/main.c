@@ -9,6 +9,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef _WIN32
+#include <malloc.h>  /* For mallopt */
+#endif
+
 static void print_usage(const char* prog) {
     printf("SRP - Small Reverse Proxy\n\n");
     printf("Usage:\n");
@@ -195,6 +199,14 @@ static int cmd_list(int argc, char** argv) {
 }
 
 int main(int argc, char** argv) {
+#ifndef _WIN32
+    /* Tune malloc BEFORE any allocations to minimize virtual memory usage */
+    mallopt(M_ARENA_MAX, 1);           /* Only 1 arena - we don't need per-thread arenas */
+    mallopt(M_MMAP_THRESHOLD, 64*1024); /* Use mmap for allocations >64KB */
+    mallopt(M_TRIM_THRESHOLD, 128*1024); /* Return memory to OS when >128KB is free */
+    mallopt(M_TOP_PAD, 64*1024);        /* Reduce heap padding */
+#endif
+
     /* Initialize platform */
     if (platform_init() != 0) {
         fprintf(stderr, "Failed to initialize platform\n");
