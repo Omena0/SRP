@@ -1225,20 +1225,27 @@ int server_run(const char* config_path) {
             /* Flush write buffer if socket is writable */
             if (FD_ISSET(srv.clients[i].sock, &write_fds)) {
                 if (srv.clients[i].write_buffer_size > 0) {
-                    int sent = send(srv.clients[i].sock,
-                                  (const char*)srv.clients[i].write_buffer,
-                                  srv.clients[i].write_buffer_size, MSG_NOSIGNAL);
-                    if (sent > 0) {
-                        memmove(srv.clients[i].write_buffer,
-                               srv.clients[i].write_buffer + sent,
-                               srv.clients[i].write_buffer_size - sent);
-                        srv.clients[i].write_buffer_size -= sent;
-                    } else if (sent < 0) {
-                        int err = socket_errno;
-                        if (!socket_would_block(err)) {
-                            log_error("Failed to write to agent %s: %d", srv.clients[i].username, err);
-                            close_client(&srv, i);
-                            continue;
+                    /* Try to flush as much as possible */
+                    while (srv.clients[i].write_buffer_size > 0) {
+                        int sent = send(srv.clients[i].sock,
+                                      (const char*)srv.clients[i].write_buffer,
+                                      srv.clients[i].write_buffer_size, MSG_NOSIGNAL);
+                        if (sent > 0) {
+                            memmove(srv.clients[i].write_buffer,
+                                   srv.clients[i].write_buffer + sent,
+                                   srv.clients[i].write_buffer_size - sent);
+                            srv.clients[i].write_buffer_size -= sent;
+                        } else if (sent < 0) {
+                            int err = socket_errno;
+                            if (socket_would_block(err)) {
+                                break; /* Socket full, try again later */
+                            } else {
+                                log_error("Failed to write to agent %s: %d", srv.clients[i].username, err);
+                                close_client(&srv, i);
+                                break;
+                            }
+                        } else {
+                            break;
                         }
                     }
                 }
@@ -1265,20 +1272,27 @@ int server_run(const char* config_path) {
             /* Flush write buffer if socket is writable */
             if (FD_ISSET(srv.tunnels[i].client_sock, &write_fds)) {
                 if (srv.tunnels[i].to_client_buffer_size > 0) {
-                    int sent = send(srv.tunnels[i].client_sock,
-                                  (const char*)srv.tunnels[i].to_client_buffer,
-                                  srv.tunnels[i].to_client_buffer_size, MSG_NOSIGNAL);
-                    if (sent > 0) {
-                        memmove(srv.tunnels[i].to_client_buffer,
-                               srv.tunnels[i].to_client_buffer + sent,
-                               srv.tunnels[i].to_client_buffer_size - sent);
-                        srv.tunnels[i].to_client_buffer_size -= sent;
-                    } else if (sent < 0) {
-                        int err = socket_errno;
-                        if (!socket_would_block(err)) {
-                            log_error("Failed to write to client: %d", err);
-                            close_tunnel(&srv, i);
-                            continue;
+                    /* Try to flush as much as possible */
+                    while (srv.tunnels[i].to_client_buffer_size > 0) {
+                        int sent = send(srv.tunnels[i].client_sock,
+                                      (const char*)srv.tunnels[i].to_client_buffer,
+                                      srv.tunnels[i].to_client_buffer_size, MSG_NOSIGNAL);
+                        if (sent > 0) {
+                            memmove(srv.tunnels[i].to_client_buffer,
+                                   srv.tunnels[i].to_client_buffer + sent,
+                                   srv.tunnels[i].to_client_buffer_size - sent);
+                            srv.tunnels[i].to_client_buffer_size -= sent;
+                        } else if (sent < 0) {
+                            int err = socket_errno;
+                            if (socket_would_block(err)) {
+                                break; /* Socket full, try again later */
+                            } else {
+                                log_error("Failed to write to client: %d", err);
+                                close_tunnel(&srv, i);
+                                break;
+                            }
+                        } else {
+                            break;
                         }
                     }
                 }
@@ -1293,20 +1307,27 @@ int server_run(const char* config_path) {
             if (srv.tunnels[i].agent_data_sock != INVALID_SOCKET_VALUE &&
                 FD_ISSET(srv.tunnels[i].agent_data_sock, &write_fds)) {
                 if (srv.tunnels[i].to_agent_buffer_size > 0) {
-                    int sent = send(srv.tunnels[i].agent_data_sock,
-                                  (const char*)srv.tunnels[i].to_agent_buffer,
-                                  srv.tunnels[i].to_agent_buffer_size, MSG_NOSIGNAL);
-                    if (sent > 0) {
-                        memmove(srv.tunnels[i].to_agent_buffer,
-                               srv.tunnels[i].to_agent_buffer + sent,
-                               srv.tunnels[i].to_agent_buffer_size - sent);
-                        srv.tunnels[i].to_agent_buffer_size -= sent;
-                    } else if (sent < 0) {
-                        int err = socket_errno;
-                        if (!socket_would_block(err)) {
-                            log_error("Failed to write to agent data socket: %d", err);
-                            close_tunnel(&srv, i);
-                            continue;
+                    /* Try to flush as much as possible */
+                    while (srv.tunnels[i].to_agent_buffer_size > 0) {
+                        int sent = send(srv.tunnels[i].agent_data_sock,
+                                      (const char*)srv.tunnels[i].to_agent_buffer,
+                                      srv.tunnels[i].to_agent_buffer_size, MSG_NOSIGNAL);
+                        if (sent > 0) {
+                            memmove(srv.tunnels[i].to_agent_buffer,
+                                   srv.tunnels[i].to_agent_buffer + sent,
+                                   srv.tunnels[i].to_agent_buffer_size - sent);
+                            srv.tunnels[i].to_agent_buffer_size -= sent;
+                        } else if (sent < 0) {
+                            int err = socket_errno;
+                            if (socket_would_block(err)) {
+                                break; /* Socket full, try again later */
+                            } else {
+                                log_error("Failed to write to agent data socket: %d", err);
+                                close_tunnel(&srv, i);
+                                break;
+                            }
+                        } else {
+                            break;
                         }
                     }
                 }
