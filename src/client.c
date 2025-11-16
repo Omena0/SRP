@@ -124,6 +124,79 @@ static int authenticate(socket_t sock, const agent_config_t* config) {
     return -1;
 }
 
+/* Reconnect to server with exponential backoff */
+static socket_t reconnect_to_server(agent_state_t* agent) {
+    int retry_delay = 1; /* Start with 1 second */
+    int max_delay = 30;  /* Max 30 seconds between retries */
+    
+    while (agent->running) {
+        log_info("Attempting to reconnect to server in %d seconds...", retry_delay);
+        
+#ifdef _WIN32
+        Sleep(retry_delay * 1000);
+#else
+        sleep(retry_delay);
+#endif
+        
+        if (!agent->running) break;
+        
+        socket_t sock = connect_to_server(&agent->config);
+        if (sock == INVALID_SOCKET_VALUE) {
+            retry_delay = (retry_delay * 2 > max_delay) ? max_delay : retry_delay * 2;
+            continue;
+        }
+        
+        /* Authenticate */
+        if (authenticate(sock, &agent->config) != 0) {
+            socket_close(sock);
+            retry_delay = (retry_delay * 2 > max_delay) ? max_delay : retry_delay * 2;
+            continue;
+        }
+        
+        /* Re-register forward ports */
+        int all_success = 1;
+        for (int i = 0; i < agent->config.forward_count; i++) {
+            uint16_t remote_port = agent->config.forwards[i].remote_port;
+            log_info("Re-registering forward for port %u", remote_port);
+            message_t* fwd_msg = message_create_port(MSG_FORWARD, remote_port);
+            if (message_send(sock, fwd_msg) != 0) {
+                log_error("Failed to send FORWARD request for port %u", remote_port);
+                message_free(fwd_msg);
+                all_success = 0;
+                break;
+            }
+            message_free(fwd_msg);
+            
+            message_t* resp = message_receive(sock);
+            if (!resp || resp->type != MSG_OK) {
+                if (resp && resp->type == MSG_ERR) {
+                    error_payload_t err;
+                    message_parse_error(resp, &err);
+                    log_error("Failed to forward port %u: %s", remote_port, err.error);
+                } else {
+                    log_error("Failed to forward port %u", remote_port);
+                }
+                if (resp) message_free(resp);
+                all_success = 0;
+                break;
+            }
+            message_free(resp);
+            log_info("Re-forwarding port %u", remote_port);
+        }
+        
+        if (!all_success) {
+            socket_close(sock);
+            retry_delay = (retry_delay * 2 > max_delay) ? max_delay : retry_delay * 2;
+            continue;
+        }
+        
+        log_info("Reconnected to server successfully");
+        return sock;
+    }
+    
+    return INVALID_SOCKET_VALUE;
+}
+
 /* Claim ports */
 /* Find tunnel by ID */
 static tunnel_connection_t* find_tunnel(agent_state_t* agent, uint32_t tunnel_id) {
@@ -557,44 +630,50 @@ int client_run(const char* config_path) {
     /* Connect to server */
     agent.server_sock = connect_to_server(&agent.config);
     if (agent.server_sock == INVALID_SOCKET_VALUE) {
-        return -1;
-    }
-    
-    /* Authenticate */
-    if (authenticate(agent.server_sock, &agent.config) != 0) {
-        socket_close(agent.server_sock);
-        return -1;
-    }
-    
-    /* Request forward port listeners from server */
-    for (int i = 0; i < agent.config.forward_count; i++) {
-        uint16_t remote_port = agent.config.forwards[i].remote_port;
-        log_info("Requesting forward for port %u", remote_port);
-        message_t* fwd_msg = message_create_port(MSG_FORWARD, remote_port);
-        if (message_send(agent.server_sock, fwd_msg) != 0) {
-            log_error("Failed to send FORWARD request for port %u", remote_port);
-            message_free(fwd_msg);
+        log_warn("Initial connection failed, will retry...");
+        agent.running = 1; /* Set running flag so reconnect works */
+        agent.server_sock = reconnect_to_server(&agent);
+        if (agent.server_sock == INVALID_SOCKET_VALUE) {
+            log_error("Failed to connect to server after retries");
+            return -1;
+        }
+    } else {
+        /* Authenticate */
+        if (authenticate(agent.server_sock, &agent.config) != 0) {
             socket_close(agent.server_sock);
             return -1;
         }
-        message_free(fwd_msg);
-        log_info("Waiting for FORWARD response for port %u", remote_port);
         
-        message_t* resp = message_receive(agent.server_sock);
-        if (!resp || resp->type != MSG_OK) {
-            if (resp && resp->type == MSG_ERR) {
-                error_payload_t err;
-                message_parse_error(resp, &err);
-                log_error("Failed to forward port %u: %s", remote_port, err.error);
-            } else {
-                log_error("Failed to forward port %u", remote_port);
+        /* Request forward port listeners from server */
+        for (int i = 0; i < agent.config.forward_count; i++) {
+            uint16_t remote_port = agent.config.forwards[i].remote_port;
+            log_info("Requesting forward for port %u", remote_port);
+            message_t* fwd_msg = message_create_port(MSG_FORWARD, remote_port);
+            if (message_send(agent.server_sock, fwd_msg) != 0) {
+                log_error("Failed to send FORWARD request for port %u", remote_port);
+                message_free(fwd_msg);
+                socket_close(agent.server_sock);
+                return -1;
             }
-            if (resp) message_free(resp);
-            socket_close(agent.server_sock);
-            return -1;
+            message_free(fwd_msg);
+            log_info("Waiting for FORWARD response for port %u", remote_port);
+            
+            message_t* resp = message_receive(agent.server_sock);
+            if (!resp || resp->type != MSG_OK) {
+                if (resp && resp->type == MSG_ERR) {
+                    error_payload_t err;
+                    message_parse_error(resp, &err);
+                    log_error("Failed to forward port %u: %s", remote_port, err.error);
+                } else {
+                    log_error("Failed to forward port %u", remote_port);
+                }
+                if (resp) message_free(resp);
+                socket_close(agent.server_sock);
+                return -1;
+            }
+            message_free(resp);
+            log_info("Forwarding port %u", remote_port);
         }
-        message_free(resp);
-        log_info("Forwarding port %u", remote_port);
     }
     
     log_info("Agent started successfully");
@@ -656,8 +735,30 @@ int client_run(const char* config_path) {
             
             if (!msg) {
                 if (!would_block) {
-                    log_error("Server connection closed");
-                    agent.running = 0;
+                    log_error("Server connection lost, attempting to reconnect...");
+                    mutex_unlock(&agent.server_sock_mutex);
+                    
+                    /* Close old socket */
+                    socket_close(agent.server_sock);
+                    
+                    /* Try to reconnect */
+                    socket_t new_sock = reconnect_to_server(&agent);
+                    if (new_sock == INVALID_SOCKET_VALUE) {
+                        log_error("Failed to reconnect to server, shutting down");
+                        agent.running = 0;
+                        goto end_message_processing;
+                    }
+                    
+                    /* Update socket and reset state */
+                    mutex_lock(&agent.server_sock_mutex);
+                    agent.server_sock = new_sock;
+                    socket_set_nonblocking(agent.server_sock);
+                    agent.last_activity = get_timestamp();
+                    agent.ping_sent = 0;
+                    mutex_unlock(&agent.server_sock_mutex);
+                    
+                    log_info("Reconnected successfully, continuing operation");
+                    goto end_message_processing;
                 }
                 break;
             }
@@ -665,6 +766,8 @@ int client_run(const char* config_path) {
             messages[msg_count++] = msg;
         }
         mutex_unlock(&agent.server_sock_mutex);
+        
+end_message_processing:
         
         /* Process messages without holding mutex (allows tunnel workers to send) */
         if (msg_count > 0) {
@@ -722,9 +825,31 @@ int client_run(const char* config_path) {
         
         if (idle_time > KEEPALIVE_TIMEOUT_SECS && agent.ping_sent) {
             /* No PONG received within timeout - connection may be dead */
-            log_error("Server keepalive timeout (%llu seconds idle), connection dead",
+            log_error("Server keepalive timeout (%llu seconds idle), reconnecting...",
                      (unsigned long long)idle_time);
-            agent.running = 0;
+            
+            /* Close old socket */
+            mutex_lock(&agent.server_sock_mutex);
+            socket_close(agent.server_sock);
+            mutex_unlock(&agent.server_sock_mutex);
+            
+            /* Try to reconnect */
+            socket_t new_sock = reconnect_to_server(&agent);
+            if (new_sock == INVALID_SOCKET_VALUE) {
+                log_error("Failed to reconnect to server, shutting down");
+                agent.running = 0;
+                continue;
+            }
+            
+            /* Update socket and reset state */
+            mutex_lock(&agent.server_sock_mutex);
+            agent.server_sock = new_sock;
+            socket_set_nonblocking(agent.server_sock);
+            agent.last_activity = get_timestamp();
+            agent.ping_sent = 0;
+            mutex_unlock(&agent.server_sock_mutex);
+            
+            log_info("Reconnected successfully after keepalive timeout");
         } else if (idle_time > KEEPALIVE_INTERVAL_SECS && !agent.ping_sent) {
             /* Send PING to keep connection alive */
             log_debug("Sending PING to server (idle for %llu seconds)",
@@ -736,8 +861,31 @@ int client_run(const char* config_path) {
             if (send_result == 0) {
                 agent.ping_sent = 1;
             } else {
-                log_error("Failed to send PING to server, connection may be dead");
-                agent.running = 0;
+                log_error("Failed to send PING to server, reconnecting...");
+                
+                /* Close old socket */
+                mutex_lock(&agent.server_sock_mutex);
+                socket_close(agent.server_sock);
+                mutex_unlock(&agent.server_sock_mutex);
+                
+                /* Try to reconnect */
+                socket_t new_sock = reconnect_to_server(&agent);
+                if (new_sock == INVALID_SOCKET_VALUE) {
+                    log_error("Failed to reconnect to server, shutting down");
+                    agent.running = 0;
+                    message_free(ping);
+                    continue;
+                }
+                
+                /* Update socket and reset state */
+                mutex_lock(&agent.server_sock_mutex);
+                agent.server_sock = new_sock;
+                socket_set_nonblocking(agent.server_sock);
+                agent.last_activity = get_timestamp();
+                agent.ping_sent = 0;
+                mutex_unlock(&agent.server_sock_mutex);
+                
+                log_info("Reconnected successfully after send failure");
             }
             message_free(ping);
         }
