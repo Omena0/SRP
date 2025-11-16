@@ -1097,22 +1097,7 @@ int server_run(const char* config_path) {
             }
         }
 
-        struct timeval timeout = {0, 1000}; /* 1ms - low latency */
-
-        /* Use shorter timeout if there's buffered data to flush (higher priority) */
-        for (int i = 0; i < MAX_CLIENTS; i++) {
-            if (srv.clients[i].active && srv.clients[i].write_buffer_size > 0) {
-                timeout.tv_usec = 100; /* 0.1ms when actively transferring */
-                break;
-            }
-        }
-        for (int i = 0; i < MAX_TUNNELS && timeout.tv_usec == 1000; i++) {
-            if (srv.tunnels[i].active &&
-                (srv.tunnels[i].to_client_buffer_size > 0 || srv.tunnels[i].to_agent_buffer_size > 0)) {
-                timeout.tv_usec = 100; /* 0.1ms when actively transferring */
-                break;
-            }
-        }
+        struct timeval timeout = {0, 1000}; /* 1ms for low latency */
 
         int ready = select(max_fd + 1, &read_fds, &write_fds, NULL, &timeout);
 
@@ -1219,7 +1204,7 @@ int server_run(const char* config_path) {
                     socket_set_nodelay(data_sock);
 
                     /* Set large buffers for data path */
-                    int bufsize = 2 * 1024 * 1024; /* 2MB */
+                    int bufsize = 4 * 1024 * 1024; /* 4MB to match client buffers */
                     setsockopt(data_sock, SOL_SOCKET, SO_RCVBUF, (const char*)&bufsize, sizeof(bufsize));
                     setsockopt(data_sock, SOL_SOCKET, SO_SNDBUF, (const char*)&bufsize, sizeof(bufsize));
 
