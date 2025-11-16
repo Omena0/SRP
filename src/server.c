@@ -282,7 +282,7 @@ static void* tunnel_worker(void* arg) {
                         fd_set wfds;
                         FD_ZERO(&wfds);
                         FD_SET(tunnel->agent_data_sock, &wfds);
-                        struct timeval tv = {5, 0};
+                        struct timeval tv = {0, 100000}; /* 100ms timeout */
                         if (select(tunnel->agent_data_sock + 1, NULL, &wfds, NULL, &tv) <= 0) {
                             log_error("Tunnel %u: Send timeout", tunnel->tunnel_id);
                             goto cleanup;
@@ -318,7 +318,7 @@ static void* tunnel_worker(void* arg) {
                         fd_set wfds;
                         FD_ZERO(&wfds);
                         FD_SET(tunnel->client_sock, &wfds);
-                        struct timeval tv = {5, 0};
+                        struct timeval tv = {0, 100000}; /* 100ms timeout */
                         if (select(tunnel->client_sock + 1, NULL, &wfds, NULL, &tv) <= 0) {
                             log_error("Tunnel %u: Send timeout", tunnel->tunnel_id);
                             goto cleanup;

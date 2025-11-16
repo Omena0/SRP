@@ -94,7 +94,7 @@ void* tunnel_worker(void* arg) {
                         fd_set wfds;
                         FD_ZERO(&wfds);
                         FD_SET(conn->data_sock, &wfds);
-                        struct timeval tv = {5, 0};
+                        struct timeval tv = {0, 100000}; /* 100ms timeout */
                         if (select(conn->data_sock + 1, NULL, &wfds, NULL, &tv) <= 0) {
                             log_error("Send timeout");
                             goto cleanup;
