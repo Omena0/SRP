@@ -941,8 +941,8 @@ static void handle_forward_port_connection(server_state_t* srv, int fp_idx) {
         }
     }
     
-    /* Limit to 10 pending tunnels per agent to prevent DoS via rapid pings */
-    if (pending_count >= 10) {
+    /* Limit to 100 pending tunnels per agent to prevent DoS while allowing burst connections */
+    if (pending_count >= 100) {
         log_warn("Too many pending tunnels (%d) for agent on port %u, rejecting connection", 
                  pending_count, fp->port);
         socket_close(client_sock);
