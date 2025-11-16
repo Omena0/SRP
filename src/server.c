@@ -931,6 +931,24 @@ static void handle_forward_port_connection(server_state_t* srv, int fp_idx) {
         return;
     }
 
+    /* Rate limiting: Count pending tunnels for this agent (no data socket yet) */
+    int pending_count = 0;
+    for (int i = 0; i < MAX_TUNNELS; i++) {
+        if (srv->tunnels[i].active && 
+            srv->tunnels[i].agent_idx == agent_idx &&
+            srv->tunnels[i].agent_data_sock == INVALID_SOCKET_VALUE) {
+            pending_count++;
+        }
+    }
+    
+    /* Limit to 10 pending tunnels per agent to prevent DoS via rapid pings */
+    if (pending_count >= 10) {
+        log_warn("Too many pending tunnels (%d) for agent on port %u, rejecting connection", 
+                 pending_count, fp->port);
+        socket_close(client_sock);
+        return;
+    }
+
     /* Create tunnel */
     int tunnel_idx = find_free_tunnel_slot(srv);
     if (tunnel_idx < 0) {
