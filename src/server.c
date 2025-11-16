@@ -1330,6 +1330,16 @@ int server_run(const char* config_path) {
         for (int i = 0; i < MAX_CLIENTS; i++) {
             if (!srv.clients[i].active || !srv.clients[i].authenticated) continue;
 
+            /* Skip keepalive for agents with active tunnels - they're actively forwarding data */
+            int has_active_tunnels = 0;
+            for (int j = 0; j < MAX_TUNNELS; j++) {
+                if (srv.tunnels[j].active && srv.tunnels[j].agent_idx == i) {
+                    has_active_tunnels = 1;
+                    break;
+                }
+            }
+            if (has_active_tunnels) continue;
+
             uint64_t idle_time = now - srv.clients[i].last_activity;
 
             if (idle_time > KEEPALIVE_TIMEOUT_SECS && srv.clients[i].ping_sent) {
