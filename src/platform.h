@@ -169,6 +169,12 @@
         pthread_attr_t attr;
         int result;
         pthread_attr_init(&attr);
+        /* Ensure we meet PTHREAD_STACK_MIN requirement (typically 16KB on Linux) */
+        #ifdef PTHREAD_STACK_MIN
+        if (stack_size < PTHREAD_STACK_MIN) {
+            stack_size = PTHREAD_STACK_MIN;
+        }
+        #endif
         pthread_attr_setstacksize(&attr, stack_size);
         result = pthread_create(thread, &attr, func, arg);
         pthread_attr_destroy(&attr);
