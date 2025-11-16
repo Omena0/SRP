@@ -224,7 +224,7 @@ static void* tunnel_worker(void* arg) {
         FD_SET(tunnel->agent_data_sock, &read_fds);
         
         timeout.tv_sec = 0;
-        timeout.tv_usec = 100000; /* 100ms - responsive but low CPU */
+        timeout.tv_usec = 1000; /* 1ms - low latency for data forwarding */
         
         socket_t max_fd = tunnel->client_sock > tunnel->agent_data_sock ? 
                          tunnel->client_sock : tunnel->agent_data_sock;
@@ -1249,7 +1249,7 @@ int server_run(const char* config_path) {
 
         /* Tunnel sockets are now handled by dedicated worker threads */
 
-        struct timeval timeout = {0, 100000}; /* 100ms - responsive but low CPU */
+        struct timeval timeout = {0, 10000}; /* 10ms - responsive but low CPU */
 
         int ready = select(max_fd + 1, &read_fds, &write_fds, NULL, &timeout);
 
