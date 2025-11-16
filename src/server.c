@@ -179,8 +179,11 @@ static void close_client(server_state_t* srv, int idx) {
 
     socket_close(client->sock);
     client->sock = INVALID_SOCKET_VALUE;
-    buffer_free(client->recv_buffer);
-    client->recv_buffer = NULL;
+    /* recv_buffer not used anymore, set to NULL if still present */
+    if (client->recv_buffer) {
+        buffer_free(client->recv_buffer);
+        client->recv_buffer = NULL;
+    }
     if (client->write_buffer) {
         xfree(client->write_buffer);
         client->write_buffer = NULL;
@@ -898,7 +901,7 @@ static void handle_forward_port_connection(server_state_t* srv, int fp_idx) {
     socket_set_nodelay(client_sock);
 
     /* Set reasonable buffers for throughput without excessive memory */
-    int bufsize = 256 * 1024; /* 256KB - plenty for Minecraft while being memory efficient */
+    int bufsize = 512 * 1024; /* 512KB - good balance for Minecraft */
     setsockopt(client_sock, SOL_SOCKET, SO_RCVBUF, (const char*)&bufsize, sizeof(bufsize));
     setsockopt(client_sock, SOL_SOCKET, SO_SNDBUF, (const char*)&bufsize, sizeof(bufsize));
 
@@ -1334,7 +1337,8 @@ int server_run(const char* config_path) {
                     srv.clients[idx].sock = client_sock;
                     srv.clients[idx].authenticated = 0;
                     srv.clients[idx].active = 1;
-                    srv.clients[idx].recv_buffer = buffer_create(BUFFER_SIZE);
+                    /* recv_buffer not needed - message_receive_nonblocking doesn't use it */
+                    srv.clients[idx].recv_buffer = NULL;
                     srv.clients[idx].write_buffer = NULL;
                     srv.clients[idx].write_buffer_size = 0;
                     srv.clients[idx].write_buffer_capacity = 0;
@@ -1400,7 +1404,7 @@ int server_run(const char* config_path) {
                     socket_set_nodelay(data_sock);
 
                     /* Set reasonable buffers for data path */
-                    int bufsize = 256 * 1024; /* 256KB - plenty for Minecraft while being memory efficient */
+                    int bufsize = 512 * 1024; /* 512KB - good balance for Minecraft */
                     setsockopt(data_sock, SOL_SOCKET, SO_RCVBUF, (const char*)&bufsize, sizeof(bufsize));
                     setsockopt(data_sock, SOL_SOCKET, SO_SNDBUF, (const char*)&bufsize, sizeof(bufsize));
 
@@ -1515,6 +1519,13 @@ int server_run(const char* config_path) {
 
     /* Cleanup */
     log_info("Server shutting down, srv.running=%d", srv.running);
+
+    /* Close all tunnels first - this will stop threads and free resources */
+    for (int i = 0; i < MAX_TUNNELS; i++) {
+        if (srv.tunnels[i].active) {
+            close_tunnel(&srv, i);
+        }
+    }
 
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (srv.clients[i].active) {
