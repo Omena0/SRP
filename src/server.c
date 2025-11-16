@@ -984,21 +984,12 @@ static void handle_forward_port_connection(server_state_t* srv, int fp_idx) {
 
     log_info("Created tunnel %u for port %u, waiting for agent data connection", tunnel->tunnel_id, fp->port);
     
-    /* Spawn worker thread for this tunnel */
-#ifdef _WIN32
-    tunnel->thread = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)tunnel_worker, tunnel, 0, NULL);
-    if (!tunnel->thread) {
+    /* Spawn worker thread with 256KB stack (instead of default 1-8MB) to reduce virtual memory per thread */
+    if (thread_create_with_stack(&tunnel->thread, (thread_func_t)tunnel_worker, tunnel, 256 * 1024) != 0) {
         log_error("Failed to create worker thread for tunnel %u", tunnel->tunnel_id);
         close_tunnel(srv, tunnel_idx);
         return;
     }
-#else
-    if (pthread_create(&tunnel->thread, NULL, tunnel_worker, tunnel) != 0) {
-        log_error("Failed to create worker thread for tunnel %u", tunnel->tunnel_id);
-        close_tunnel(srv, tunnel_idx);
-        return;
-    }
-#endif
     
     log_debug("Tunnel %u worker thread spawned", tunnel->tunnel_id);
 }

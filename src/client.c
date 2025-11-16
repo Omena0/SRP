@@ -485,8 +485,8 @@ static void handle_tunnel_open(agent_state_t* agent, const message_t* msg) {
     tunnel->write_buffer_capacity = 524288;
     mutex_init(&tunnel->write_mutex);
     
-    /* Start tunnel worker thread */
-    if (thread_create(&agent->tunnel_threads[idx], (thread_func_t)tunnel_worker, tunnel) != 0) {
+    /* Start tunnel worker thread with 256KB stack to reduce memory usage */
+    if (thread_create_with_stack(&agent->tunnel_threads[idx], (thread_func_t)tunnel_worker, tunnel, 256 * 1024) != 0) {
         log_error("Failed to create tunnel worker thread");
         socket_close(local_sock);
         tunnel->active = 0;

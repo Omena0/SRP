@@ -58,6 +58,11 @@
         return (*thread == NULL) ? -1 : 0;
     }
 
+    static inline int thread_create_with_stack(thread_t* thread, thread_func_t func, void* arg, size_t stack_size) {
+        *thread = CreateThread(NULL, stack_size, func, arg, 0, NULL);
+        return (*thread == NULL) ? -1 : 0;
+    }
+
     static inline int thread_join(thread_t thread) {
         WaitForSingleObject(thread, INFINITE);
         CloseHandle(thread);
@@ -158,6 +163,16 @@
 
     static inline int thread_create(thread_t* thread, thread_func_t func, void* arg) {
         return pthread_create(thread, NULL, func, arg);
+    }
+
+    static inline int thread_create_with_stack(thread_t* thread, thread_func_t func, void* arg, size_t stack_size) {
+        pthread_attr_t attr;
+        int result;
+        pthread_attr_init(&attr);
+        pthread_attr_setstacksize(&attr, stack_size);
+        result = pthread_create(thread, &attr, func, arg);
+        pthread_attr_destroy(&attr);
+        return result;
     }
 
     static inline int thread_join(thread_t thread) {
