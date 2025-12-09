@@ -539,12 +539,8 @@ static void handle_auth(server_state_t* srv, int client_idx, const message_t* ms
         return;
     }
 
-    /* Check if user already connected - disconnect old session */
-    int existing = find_client_by_username(srv, auth.username);
-    if (existing >= 0) {
-        log_info("User %s reconnecting, closing old session", auth.username);
-        close_client(srv, existing);
-    }
+    /* Allow multiple connections from the same user (for multiple agents) */
+    /* Previously we would disconnect old sessions, but now we support multiple agents per user */
 
     strncpy(client->username, auth.username, sizeof(client->username) - 1);
     client->username[sizeof(client->username) - 1] = '\0';
