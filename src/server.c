@@ -62,6 +62,7 @@ typedef struct {
     uint16_t port;
     socket_t listen_sock;
     char owner[64];      /* Username that claimed this port */
+    int client_idx;      /* Index of the client that created this port */
     uint8_t active;
 } forward_port_t;
 
@@ -167,10 +168,9 @@ static void close_client(server_state_t* srv, int idx) {
         }
     }
 
-    /* Close all forwarded ports for this agent */
+    /* Close all forwarded ports for this specific client */
     for (int i = 0; i < MAX_FORWARD_PORTS; i++) {
-        if (srv->forward_ports[i].active &&
-            strcmp(srv->forward_ports[i].owner, client->username) == 0) {
+        if (srv->forward_ports[i].active && srv->forward_ports[i].client_idx == idx) {
             socket_close(srv->forward_ports[i].listen_sock);
             srv->forward_ports[i].active = 0;
             log_info("Closed forwarded port %u", srv->forward_ports[i].port);
@@ -469,7 +469,7 @@ static void close_tunnel(server_state_t* srv, int idx) {
 }
 
 /* Create forwarded port listener */
-static int create_forward_port(server_state_t* srv, uint16_t port, const char* owner) {
+static int create_forward_port(server_state_t* srv, uint16_t port, const char* owner, int client_idx) {
     int idx = find_free_forward_port_slot(srv);
     if (idx < 0) {
         log_error("No free forward port slots");
@@ -508,6 +508,7 @@ static int create_forward_port(server_state_t* srv, uint16_t port, const char* o
     srv->forward_ports[idx].listen_sock = sock;
     strncpy(srv->forward_ports[idx].owner, owner, sizeof(srv->forward_ports[idx].owner) - 1);
     srv->forward_ports[idx].owner[sizeof(srv->forward_ports[idx].owner) - 1] = '\0';
+    srv->forward_ports[idx].client_idx = client_idx;
     srv->forward_ports[idx].active = 1;
 
     log_info("Created forward port %u for user %s", port, owner);
@@ -557,7 +558,7 @@ static void handle_auth(server_state_t* srv, int client_idx, const message_t* ms
         for (int i = 0; i < user->claimed_count; i++) {
             uint16_t port = user->claimed_ports[i];
             if (!find_forward_port(srv, port)) {
-                if (create_forward_port(srv, port, client->username) == 0) {
+                if (create_forward_port(srv, port, client->username, client_idx) == 0) {
                     log_info("Created forward port %u for user %s", port, client->username);
                 }
             }
@@ -627,7 +628,7 @@ static void handle_claim(server_state_t* srv, int client_idx, const message_t* m
 
     /* Create forward port listener if not exists */
     if (!find_forward_port(srv, port)) {
-        if (create_forward_port(srv, port, client->username) != 0) {
+        if (create_forward_port(srv, port, client->username, client_idx) != 0) {
             login_store_unclaim_port(srv->login_store, client->username, port);
             message_t* err = message_create_error("Failed to create forward listener");
             message_send(client->sock, err);
@@ -777,7 +778,7 @@ static void handle_forward(server_state_t* srv, int client_idx, const message_t*
     }
 
     /* Create forward port listener */
-    if (create_forward_port(srv, port, client->username) != 0) {
+    if (create_forward_port(srv, port, client->username, client_idx) != 0) {
         message_t* err = message_create_error("Failed to create forward listener");
         message_send(client->sock, err);
         message_free(err);

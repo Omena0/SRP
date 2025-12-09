@@ -6,6 +6,7 @@
 #ifndef _WIN32
 /* Expose POSIX APIs like strnlen, nanosleep, select, timeval, etc. */
 #define _POSIX_C_SOURCE 200809L
+#define _DEFAULT_SOURCE
 #endif
 
 #ifdef _WIN32
@@ -129,6 +130,13 @@
     #include <sys/time.h>
     /* For nanosleep */
     #include <time.h>
+    /* For string functions */
+    #include <string.h>
+
+    /* Ensure nanosleep is declared */
+    int nanosleep(const struct timespec *req, struct timespec *rem);
+    /* Ensure strnlen is declared */
+    size_t strnlen(const char *s, size_t maxlen);
 
     typedef int socket_t;
     typedef pthread_t thread_t;
