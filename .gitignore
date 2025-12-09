@@ -2,6 +2,8 @@
 build
 *.o
 *.exe
+srp*
+bin/
 
 # IDE/Editor
 .vscode/
