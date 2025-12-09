@@ -1,5 +1,9 @@
 # Build artifacts
 build
+*.o
+*.exe
+srp*
+bin/
 
 # IDE/Editor
 .vscode/
