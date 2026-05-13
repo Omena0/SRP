@@ -31,17 +31,21 @@ Uptime is not guaranteed, but its public and free forever right!
 ### srps.conf
 
 ```conf
-host=127.0.0.1:6969
+# Management/control port (agents connect here)
+host=0.0.0.0:20005
+
+# Data port for tunnel connections
+data_port=20006
 
 # Port forwarding restrictions
 min_port=20000
-max_port=21000
+max_port=24999
 ports_per_login=10
 logins_per_ip=3
 
 # Restricted ports (comma-separated, can only be used via config file assignment)
 # Example: restricted_ports=22,80,443,3306
-restricted_ports=
+restricted_ports=20005,20006
 ```
 
 ### forwards.conf
@@ -51,12 +55,12 @@ restricted_ports=
 server=127.0.0.1:6969
 
 # Login
-passwd=Omena0:bingchilling
+passwd=username:password
 
 # Forwards
 # <remote port> -> <local port>
 forwards=[
-    20001 -> 8000
+    20069 -> 8000
 ]
 ```
 
