@@ -21,6 +21,11 @@
 ./srp serve
 ```
 
+## Public instance
+
+There is a public instance running at `omena0.txx.fi:20005`.
+Uptime is not guaranteed, but its public and free forever right!
+
 ## Config format
 
 ### srps.conf
