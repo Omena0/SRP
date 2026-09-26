@@ -16,7 +16,7 @@
 ./srp register <username> <password>
 ./srp deletelogin <username> <password>
 ./srp claim <port>
-./srp unclaim <username> <password>
+./srp unclaim <port>
 ./srp forward
 ./srp serve
 ```
